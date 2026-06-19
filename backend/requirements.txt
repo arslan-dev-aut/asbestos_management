@@ -1,0 +1,6 @@
+joblogic-automation-sdk
+fastapi
+uvicorn[standard]
+apscheduler
+pytest
+pytest-asyncio

@@ -1,0 +1,305 @@
+# Shared Template: Rollback Container App
+# Purpose: Activate a previous revision to rollback deployment
+# Target: < 2 minutes execution
+#
+# Usage:
+#   - template: deploy/templates/rollback.yml
+#     parameters:
+#       azureSubscription: $(azureSubscription)
+#       revisionName: ${{ parameters.rollbackRevision }}
+#       triggerRollback: ${{ parameters.triggerRollback }}
+
+parameters:
+  - name: azureSubscription
+    type: string
+  - name: stageName
+    type: string
+    default: 'Rollback'
+  - name: displayName
+    type: string
+    default: 'Rollback Container App'
+  - name: revisionName
+    type: string
+    default: 'previous'
+  - name: triggerRollback
+    type: boolean
+    default: true
+  - name: dependsOn
+    type: object
+    default: []
+  - name: condition
+    type: string
+    default: 'succeeded()'
+  # Health check parameters
+  - name: healthEndpoint
+    type: string
+    default: '/health'
+  - name: expectedStatus
+    type: number
+    default: 200
+  - name: healthCheckRetries
+    type: number
+    default: 5
+  - name: healthCheckDelay
+    type: number
+    default: 10
+  # Cascading rollback - how many revisions back to try
+  - name: maxRollbackDepth
+    type: number
+    default: 5
+
+stages:
+  - stage: ${{ parameters.stageName }}
+    displayName: '${{ parameters.displayName }}'
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: and(${{ parameters.condition }}, eq('${{ parameters.triggerRollback }}', true))
+    jobs:
+      - job: RollbackJob
+        displayName: 'Activate Previous Revision'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Rollback to revision'
+            inputs:
+              azureSubscription: '${{ parameters.azureSubscription }}'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -euo pipefail
+
+                APP_NAME="$(CONTAINERNAME)"
+                RG="$(RESOURCEGROUP)"
+                INITIAL_REVISION="${{ parameters.revisionName }}"
+                MAX_ROLLBACK_DEPTH=${{ parameters.maxRollbackDepth }}
+                HEALTH_ENDPOINT="${{ parameters.healthEndpoint }}"
+                EXPECTED_STATUS="${{ parameters.expectedStatus }}"
+                HEALTH_RETRIES=${{ parameters.healthCheckRetries }}
+                HEALTH_DELAY=${{ parameters.healthCheckDelay }}
+
+                echo "============================================"
+                echo "CASCADING ROLLBACK OPERATION"
+                echo "============================================"
+                echo "App: $APP_NAME"
+                echo "Resource Group: $RG"
+                echo "Max rollback depth: $MAX_ROLLBACK_DEPTH revisions"
+                echo "============================================"
+
+                # Install/upgrade containerapp extension
+                az extension add --name containerapp --upgrade --allow-preview true 2>/dev/null || true
+
+                # Get app URL for health checks
+                APP_URL=$(az containerapp show \
+                  --name "$APP_NAME" \
+                  --resource-group "$RG" \
+                  --query "properties.configuration.ingress.fqdn" -o tsv)
+                HEALTH_URL="https://${APP_URL}${HEALTH_ENDPOINT}"
+
+                # Check revision mode
+                REVISION_MODE=$(az containerapp show \
+                  --name "$APP_NAME" \
+                  --resource-group "$RG" \
+                  --query "properties.configuration.activeRevisionsMode" -o tsv 2>/dev/null || echo "Single")
+                echo "Revision mode: $REVISION_MODE"
+
+                # List all revisions
+                echo ""
+                echo "=== All Revisions ==="
+                az containerapp revision list \
+                  --name "$APP_NAME" \
+                  --resource-group "$RG" \
+                  --all \
+                  --query "[].{Name:name, Active:properties.active, Created:properties.createdTime}" \
+                  -o table
+
+                # Get inactive revisions sorted by creation time (newest first for rollback)
+                # We reverse the sort to try most recent first
+                INACTIVE_REVISIONS=$(az containerapp revision list \
+                  --name "$APP_NAME" \
+                  --resource-group "$RG" \
+                  --all \
+                  --query "reverse(sort_by([?properties.active==\`false\`], &properties.createdTime))[].name" \
+                  -o tsv 2>/dev/null || echo "")
+
+                if [ -z "$INACTIVE_REVISIONS" ]; then
+                  echo ""
+                  echo "============================================"
+                  echo "⚠️  NO PREVIOUS REVISIONS AVAILABLE"
+                  echo "============================================"
+                  echo "No inactive revisions found to rollback to."
+                  echo "Manual intervention required!"
+                  echo ""
+                  echo "##vso[task.logissue type=warning]No previous revision found - cannot auto-rollback"
+                  echo "##vso[task.complete result=SucceededWithIssues;]Rollback skipped - no previous revision"
+                  exit 0
+                fi
+
+                # Convert to array and limit to max depth
+                readarray -t REVISIONS_ARRAY <<< "$INACTIVE_REVISIONS"
+                TOTAL_REVISIONS=${#REVISIONS_ARRAY[@]}
+                echo ""
+                echo "Found $TOTAL_REVISIONS inactive revision(s) to try (max depth: $MAX_ROLLBACK_DEPTH)"
+
+                # Health check function
+                check_health() {
+                  local retries=$HEALTH_RETRIES
+                  local delay=$HEALTH_DELAY
+                  
+                  for i in $(seq 1 $retries); do
+                    echo "    Health check attempt $i/$retries..."
+                    
+                    HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" --max-time 30 "$HEALTH_URL" 2>/dev/null || echo -e "\n000")
+                    HTTP_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
+                    HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n 1)
+                    
+                    echo "    Status: $HTTP_STATUS"
+                    
+                    if [ "$HTTP_STATUS" = "$EXPECTED_STATUS" ]; then
+                      if echo "$HTTP_BODY" | grep -q "healthy"; then
+                        echo "    ✅ Health check PASSED"
+                        return 0
+                      fi
+                    fi
+                    
+                    if [ $i -lt $retries ]; then
+                      echo "    Waiting ${delay}s..."
+                      sleep $delay
+                    fi
+                  done
+                  
+                  echo "    ❌ Health check FAILED"
+                  return 1
+                }
+
+                # Activate revision function
+                activate_revision() {
+                  local target_rev=$1
+                  
+                  # Get current active revision
+                  local current_rev=$(az containerapp revision list \
+                    --name "$APP_NAME" \
+                    --resource-group "$RG" \
+                    --all \
+                    --query "[?properties.active==\`true\`].name | [0]" -o tsv 2>/dev/null || echo "")
+                  
+                  # Check if target is already active
+                  local is_active=$(az containerapp revision show \
+                    --name "$APP_NAME" \
+                    --resource-group "$RG" \
+                    --revision "$target_rev" \
+                    --query "properties.active" -o tsv 2>/dev/null || echo "false")
+                  
+                  if [ "$is_active" != "true" ]; then
+                    echo "  Activating revision: $target_rev"
+                    az containerapp revision activate \
+                      --name "$APP_NAME" \
+                      --resource-group "$RG" \
+                      --revision "$target_rev"
+                  fi
+                  
+                  # In single mode, deactivate current
+                  if [ "$REVISION_MODE" = "Single" ] || [ "$REVISION_MODE" = "single" ]; then
+                    if [ -n "$current_rev" ] && [ "$current_rev" != "$target_rev" ]; then
+                      echo "  Deactivating revision: $current_rev"
+                      az containerapp revision deactivate \
+                        --name "$APP_NAME" \
+                        --resource-group "$RG" \
+                        --revision "$current_rev" 2>/dev/null || true
+                    fi
+                  else
+                    # Multiple mode - route traffic
+                    az containerapp ingress traffic set \
+                      --name "$APP_NAME" \
+                      --resource-group "$RG" \
+                      --revision-weight "$target_rev=100"
+                  fi
+                }
+
+                # Cascading rollback loop
+                START_TIME=$(date +%s)
+                ROLLBACK_SUCCESS=false
+                SUCCESSFUL_REVISION=""
+                TRIED_REVISIONS=()
+
+                for idx in "${!REVISIONS_ARRAY[@]}"; do
+                  # Check depth limit
+                  if [ $idx -ge $MAX_ROLLBACK_DEPTH ]; then
+                    echo ""
+                    echo "Reached max rollback depth ($MAX_ROLLBACK_DEPTH). Stopping."
+                    break
+                  fi
+                  
+                  REVISION="${REVISIONS_ARRAY[$idx]}"
+                  TRIED_REVISIONS+=("$REVISION")
+                  
+                  echo ""
+                  echo "============================================"
+                  echo "TRYING REVISION $((idx + 1))/$MAX_ROLLBACK_DEPTH: $REVISION"
+                  echo "============================================"
+                  
+                  # Activate this revision
+                  activate_revision "$REVISION"
+                  
+                  # Wait a moment for the revision to become ready
+                  echo "  Waiting 5s for revision to stabilize..."
+                  sleep 5
+                  
+                  # Health check
+                  echo "  Running health check..."
+                  if check_health; then
+                    ROLLBACK_SUCCESS=true
+                    SUCCESSFUL_REVISION="$REVISION"
+                    break
+                  else
+                    echo ""
+                    echo "  ⚠️  Revision $REVISION is unhealthy, trying older revision..."
+                  fi
+                done
+
+                END_TIME=$(date +%s)
+                DURATION=$((END_TIME - START_TIME))
+
+                echo ""
+                echo ""
+                echo "============================================"
+                echo "CASCADING ROLLBACK SUMMARY"
+                echo "============================================"
+                echo "Duration: ${DURATION} seconds"
+                echo "Revisions tried: ${#TRIED_REVISIONS[@]}"
+                for rev in "${TRIED_REVISIONS[@]}"; do
+                  if [ "$rev" = "$SUCCESSFUL_REVISION" ]; then
+                    echo "  ✅ $rev (HEALTHY)"
+                  else
+                    echo "  ❌ $rev (UNHEALTHY)"
+                  fi
+                done
+                echo ""
+
+                if [ "$ROLLBACK_SUCCESS" = "true" ]; then
+                  echo "============================================"
+                  echo "✅ ROLLBACK SUCCESSFUL"
+                  echo "Active Revision: $SUCCESSFUL_REVISION"
+                  echo "============================================"
+                  
+                  # Show final state
+                  echo ""
+                  echo "=== Final State ==="
+                  az containerapp revision list \
+                    --name "$APP_NAME" \
+                    --resource-group "$RG" \
+                    --all \
+                    --query "[?properties.active==\`true\`].{Name:name, Active:properties.active}" \
+                    -o table
+                else
+                  echo "============================================"
+                  echo "❌ ALL REVISIONS UNHEALTHY"
+                  echo "============================================"
+                  echo "Tried ${#TRIED_REVISIONS[@]} revision(s), none passed health check."
+                  echo ""
+                  echo "Manual intervention required:"
+                  echo "  1. Check application logs"
+                  echo "  2. Fix the application code"
+                  echo "  3. Redeploy with a working version"
+                  echo ""
+                  echo "##vso[task.logissue type=error]Cascading rollback failed - all ${#TRIED_REVISIONS[@]} revisions unhealthy"
+                  echo "##vso[task.complete result=Failed;]All rollback revisions are unhealthy"
+                  exit 1
+                fi

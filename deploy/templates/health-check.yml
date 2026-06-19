@@ -1,0 +1,191 @@
+# Shared Template: Post-Deploy Health Check
+# Purpose: Verify application API is responding correctly after deployment
+# Checks: HTTP status, response body, response time
+#
+# Usage:
+#   - template: deploy/templates/health-check.yml
+#     parameters:
+#       azureSubscription: $(azureSubscription)
+#       healthEndpoint: '/health'
+#       expectedStatus: 200
+#       timeoutSeconds: 120
+#       retryCount: 5
+
+parameters:
+  - name: azureSubscription
+    type: string
+  - name: healthEndpoint
+    type: string
+    default: '/health'
+  - name: expectedStatus
+    type: number
+    default: 200
+  - name: expectedBodyContains
+    type: string
+    default: 'healthy'
+  - name: timeoutSeconds
+    type: number
+    default: 120
+  - name: retryCount
+    type: number
+    default: 5
+  - name: retryDelaySeconds
+    type: number
+    default: 10
+  - name: dependsOn
+    type: object
+    default: []
+  - name: condition
+    type: string
+    default: 'succeeded()'
+  - name: failOnUnhealthy
+    type: boolean
+    default: true
+
+stages:
+  - stage: HealthCheck
+    displayName: 'Post-Deploy Health Check'
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    jobs:
+      - job: HealthCheckJob
+        displayName: 'Verify API Health'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Check Application Health'
+            inputs:
+              azureSubscription: '${{ parameters.azureSubscription }}'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -euo pipefail
+
+                APP_NAME="$(CONTAINERNAME)"
+                RG="$(RESOURCEGROUP)"
+                HEALTH_ENDPOINT="${{ parameters.healthEndpoint }}"
+                EXPECTED_STATUS="${{ parameters.expectedStatus }}"
+                EXPECTED_BODY="${{ parameters.expectedBodyContains }}"
+                TIMEOUT="${{ parameters.timeoutSeconds }}"
+                RETRY_COUNT="${{ parameters.retryCount }}"
+                RETRY_DELAY="${{ parameters.retryDelaySeconds }}"
+                FAIL_ON_UNHEALTHY="${{ parameters.failOnUnhealthy }}"
+
+                echo "============================================"
+                echo "POST-DEPLOY HEALTH CHECK"
+                echo "============================================"
+                echo "App: $APP_NAME"
+                echo "Health Endpoint: $HEALTH_ENDPOINT"
+                echo "Expected Status: $EXPECTED_STATUS"
+                echo "Expected Body Contains: $EXPECTED_BODY"
+                echo "Timeout: ${TIMEOUT}s"
+                echo "Retries: $RETRY_COUNT (delay: ${RETRY_DELAY}s)"
+                echo "============================================"
+
+                # Install containerapp extension
+                az extension add --name containerapp --upgrade --allow-preview true 2>/dev/null || true
+
+                # Get the app's FQDN
+                echo ""
+                echo "=== Getting Application URL ==="
+                FQDN=$(az containerapp show \
+                  --name "$APP_NAME" \
+                  --resource-group "$RG" \
+                  --query "properties.configuration.ingress.fqdn" \
+                  -o tsv 2>/dev/null || true)
+
+                if [ -z "$FQDN" ] || [ "$FQDN" = "null" ]; then
+                  echo "##vso[task.logissue type=warning]Could not get FQDN - app may not have ingress enabled"
+                  echo "Skipping HTTP health check for apps without ingress (e.g., Container Jobs)"
+                  exit 0
+                fi
+
+                HEALTH_URL="https://${FQDN}${HEALTH_ENDPOINT}"
+                echo "Health URL: $HEALTH_URL"
+
+                # Health check with retries
+                echo ""
+                echo "=== Running Health Checks ==="
+                
+                HEALTHY=false
+                START_TIME=$(date +%s)
+
+                for i in $(seq 1 $RETRY_COUNT); do
+                  CURRENT_TIME=$(date +%s)
+                  ELAPSED=$((CURRENT_TIME - START_TIME))
+                  
+                  if [ $ELAPSED -ge $TIMEOUT ]; then
+                    echo "Timeout reached (${TIMEOUT}s)"
+                    break
+                  fi
+
+                  echo ""
+                  echo "--- Attempt $i of $RETRY_COUNT ---"
+                  
+                  # Make HTTP request and capture response
+                  HTTP_RESPONSE=$(curl -s -w "\n%{http_code}\n%{time_total}" \
+                    --max-time 30 \
+                    --retry 0 \
+                    "$HEALTH_URL" 2>/dev/null || echo -e "\n000\n0")
+                  
+                  # Parse response
+                  RESPONSE_BODY=$(echo "$HTTP_RESPONSE" | head -n -2)
+                  HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -n 2 | head -n 1)
+                  RESPONSE_TIME=$(echo "$HTTP_RESPONSE" | tail -n 1)
+                  
+                  echo "HTTP Status: $HTTP_CODE"
+                  echo "Response Time: ${RESPONSE_TIME}s"
+                  echo "Response Body: $RESPONSE_BODY"
+
+                  # Check status code
+                  if [ "$HTTP_CODE" != "$EXPECTED_STATUS" ]; then
+                    echo "❌ Status check failed (expected $EXPECTED_STATUS, got $HTTP_CODE)"
+                    sleep $RETRY_DELAY
+                    continue
+                  fi
+
+                  # Check response body contains expected string
+                  if [ -n "$EXPECTED_BODY" ] && ! echo "$RESPONSE_BODY" | grep -q "$EXPECTED_BODY"; then
+                    echo "❌ Body check failed (expected to contain '$EXPECTED_BODY')"
+                    sleep $RETRY_DELAY
+                    continue
+                  fi
+
+                  # All checks passed
+                  echo "✅ Health check passed!"
+                  HEALTHY=true
+                  break
+                done
+
+                END_TIME=$(date +%s)
+                TOTAL_DURATION=$((END_TIME - START_TIME))
+
+                echo ""
+                echo "============================================"
+                if [ "$HEALTHY" = true ]; then
+                  echo "HEALTH CHECK: PASSED"
+                  echo "Duration: ${TOTAL_DURATION}s"
+                  echo "============================================"
+                else
+                  echo "HEALTH CHECK: FAILED"
+                  echo "Duration: ${TOTAL_DURATION}s"
+                  echo "============================================"
+                  
+                  # Get container app logs for debugging
+                  echo ""
+                  echo "=== Recent App Logs (for debugging) ==="
+                  az containerapp logs show \
+                    --name "$APP_NAME" \
+                    --resource-group "$RG" \
+                    --tail 50 2>/dev/null || echo "Could not fetch logs"
+
+                  if [ "$FAIL_ON_UNHEALTHY" = "True" ] || [ "$FAIL_ON_UNHEALTHY" = "true" ]; then
+                    echo ""
+                    echo "##vso[task.logissue type=error]Application health check failed after ${TOTAL_DURATION}s"
+                    echo "##vso[task.complete result=Failed;]Health check failed"
+                    exit 1
+                  else
+                    echo ""
+                    echo "##vso[task.logissue type=warning]Application health check failed but failOnUnhealthy=false"
+                    echo "##vso[task.complete result=SucceededWithIssues;]Health check failed (non-blocking)"
+                  fi
+                fi

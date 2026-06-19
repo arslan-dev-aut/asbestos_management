@@ -1,0 +1,87 @@
+# Shared Template: Deploy to Azure Container App
+# Usage:
+#   - template: deploy/templates/deploy-container-app.yml
+#     parameters:
+#       azureSubscription: 'your-subscription'
+#       deployScriptPath: 'deploy/scripts/containerapp.sh'
+#       environment: 'Approval for YAML Pipelines'  # Optional
+#       requiresApproval: true/false
+
+parameters:
+  - name: azureSubscription
+    type: string
+  - name: deployScriptPath
+    type: string
+    default: 'deploy/scripts/containerapp.sh'
+  - name: stageName
+    type: string
+    default: 'Deploy'
+  - name: displayName
+    type: string
+    default: 'Deploy to Azure Container App'
+  - name: dependsOn
+    type: object
+    default: []
+  - name: condition
+    type: string
+    default: 'succeeded()'
+  - name: requiresApproval
+    type: boolean
+    default: false
+  - name: environment
+    type: string
+    default: ''
+  - name: customEnvVars
+    type: string
+    default: ''
+  - name: resourceSize
+    type: string
+    default: ''
+  - name: minReplicas
+    type: string
+    default: ''
+
+stages:
+  - stage: ${{ parameters.stageName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    jobs:
+      # Deployment with approval (uses environment)
+      - ${{ if eq(parameters.requiresApproval, true) }}:
+          - deployment: Deploy
+            displayName: 'Deploy to Azure Container App'
+            environment: ${{ parameters.environment }}
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                    - task: AzureCLI@2
+                      displayName: 'Deploy (Container App or Job)'
+                      inputs:
+                        azureSubscription: '${{ parameters.azureSubscription }}'
+                        scriptType: 'bash'
+                        scriptLocation: 'scriptPath'
+                        scriptPath: '$(Build.SourcesDirectory)/${{ parameters.deployScriptPath }}'
+                      env:
+                        CUSTOM_ENV_VARS: ${{ parameters.customEnvVars }}
+                        OVERRIDE_RESOURCE_SIZE: ${{ parameters.resourceSize }}
+                        OVERRIDE_MIN_REPLICAS: ${{ parameters.minReplicas }}
+
+      # Deployment without approval (standard job)
+      - ${{ if eq(parameters.requiresApproval, false) }}:
+          - job: Deploy
+            displayName: 'Deploy to Azure Container App'
+            steps:
+              - task: AzureCLI@2
+                displayName: 'Deploy (Container App or Job)'
+                inputs:
+                  azureSubscription: '${{ parameters.azureSubscription }}'
+                  scriptType: 'bash'
+                  scriptLocation: 'scriptPath'
+                  scriptPath: '$(Build.SourcesDirectory)/${{ parameters.deployScriptPath }}'
+                env:
+                  CUSTOM_ENV_VARS: ${{ parameters.customEnvVars }}
+                  OVERRIDE_RESOURCE_SIZE: ${{ parameters.resourceSize }}
+                  OVERRIDE_MIN_REPLICAS: ${{ parameters.minReplicas }}

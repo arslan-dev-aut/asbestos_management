@@ -1,0 +1,67 @@
+# Shared Template: Unit Tests
+# Usage:
+#   - template: deploy/templates/unit-tests.yml
+#     parameters:
+#       pythonVersion: '3.11'
+#       coverageThreshold: 80
+
+parameters:
+  - name: pythonVersion
+    type: string
+    default: '3.11'
+  - name: coverageThreshold
+    type: number
+    default: 80
+  - name: testPath
+    type: string
+    default: 'tests/'
+  - name: requirementsFile
+    type: string
+    default: 'requirements.txt'
+  - name: dependsOn
+    type: object
+    default: ['Build']
+
+stages:
+  - stage: Test
+    displayName: 'Run Unit Tests'
+    dependsOn: ${{ parameters.dependsOn }}
+    jobs:
+      - job: UnitTests
+        displayName: 'Unit Tests & Coverage'
+        steps:
+          # Create virtual environment and install dependencies (PEP 668 compliant)
+          - script: |
+              python3 --version
+              python3 -m venv .venv
+              source .venv/bin/activate
+              python -m pip install --upgrade pip
+              pip install -r ${{ parameters.requirementsFile }}
+            displayName: 'Create venv & Install dependencies'
+
+          - script: |
+              source .venv/bin/activate
+              python -m pytest ${{ parameters.testPath }} \
+                --junitxml=test-results.xml \
+                --cov=test_app \
+                --cov-report=xml:coverage.xml \
+                --cov-report=html:htmlcov \
+                --cov-fail-under=${{ parameters.coverageThreshold }} \
+                -v
+            displayName: 'Run pytest with coverage'
+            continueOnError: false
+
+          - task: PublishTestResults@2
+            displayName: 'Publish Test Results'
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: 'test-results.xml'
+              testRunTitle: 'Unit Tests'
+              failTaskOnFailedTests: true
+
+          - task: PublishCodeCoverageResults@2
+            displayName: 'Publish Code Coverage'
+            condition: succeededOrFailed()
+            inputs:
+              summaryFileLocation: 'coverage.xml'

@@ -1,0 +1,65 @@
+{
+  "name": "Joblogic Automation Dev",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+
+  "forwardPorts": [8000, 5173],
+  "portsAttributes": {
+    "8000": {
+      "label": "Backend",
+      "onAutoForward": "notify"
+    },
+    "5173": {
+      "label": "Vue Frontend",
+      "onAutoForward": "notify"
+    }
+  },
+
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "mounts": [
+    "source=joblogic-audit-data,target=/data,type=volume"
+  ],
+
+  "remoteUser": "vscode",
+
+  "remoteEnv": {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUNBUFFERED": "1"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "Vue.volar",
+        "esbenp.prettier-vscode",
+        "dbaeumer.vscode-eslint",
+        "ms-azuretools.vscode-docker",
+        "humao.rest-client"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.testing.pytestEnabled": true,
+        "editor.formatOnSave": true,
+        "editor.tabSize": 2,
+        "files.trimTrailingWhitespace": true,
+        "[python]": {
+          "editor.defaultFormatter": "charliermarsh.ruff"
+        },
+        "[typescript]": {
+          "editor.defaultFormatter": "esbenp.prettier-vscode"
+        },
+        "[vue]": {
+          "editor.defaultFormatter": "Vue.volar"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,121 @@
+# Shared Template: Merge-Down
+# Purpose: Automatically merge changes to downstream branches after successful deploy
+# Flow: main → staging → uat
+#
+# Usage:
+#   - template: deploy/templates/merge-down.yml
+#     parameters:
+#       dependsOn: ['DeployMain', 'DeployNonMain']
+#       condition: ...
+#
+# Requirements:
+#   - Build Service must have "Contribute" permission on repo
+#   - Pipeline setting: "Allow scripts to access the OAuth token"
+
+parameters:
+  - name: dependsOn
+    type: object
+    default: []
+  - name: condition
+    type: string
+    default: 'succeeded()'
+  - name: skipMergeDown
+    type: boolean
+    default: false
+
+stages:
+  - stage: MergeDown
+    displayName: 'Merge Down to Lower Environments'
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: and(${{ parameters.condition }}, eq('${{ parameters.skipMergeDown }}', false))
+    jobs:
+      - job: MergeDownJob
+        displayName: 'Merge to downstream branches'
+        steps:
+          - checkout: self
+            persistCredentials: true
+            clean: true
+            fetchDepth: 0
+
+          - bash: |
+              set -euo pipefail
+
+              CURRENT_BRANCH="$(Build.SourceBranchName)"
+              MERGE_FAILED=false
+
+              echo "============================================"
+              echo "MERGE-DOWN OPERATION"
+              echo "============================================"
+              echo "Current Branch: $CURRENT_BRANCH"
+              echo "============================================"
+
+              git config user.email "azure-pipelines@local"
+              git config user.name "Azure Pipelines"
+
+              # Fetch all branches
+              git fetch origin "+refs/heads/*:refs/remotes/origin/*"
+
+              # Determine target branches based on current branch
+              # main → staging
+              # staging → uat
+              TARGETS=""
+              case "$CURRENT_BRANCH" in
+                main)
+                  TARGETS="staging"
+                  ;;
+                staging)
+                  TARGETS="uat"
+                  ;;
+                *)
+                  echo "Branch '$CURRENT_BRANCH' does not have a merge-down target. Skipping."
+                  exit 0
+                  ;;
+              esac
+
+              echo "Target branches: $TARGETS"
+              echo ""
+
+              for target in $TARGETS; do
+                echo "=== Merging '$CURRENT_BRANCH' → '$target' ==="
+
+                # Check if target branch exists
+                if ! git ls-remote --exit-code --heads origin "$target" >/dev/null 2>&1; then
+                  echo "##vso[task.logissue type=warning]Target branch '$target' does not exist. Skipping."
+                  continue
+                fi
+
+                # Reset local branch to remote target
+                git checkout -B "$target" "origin/$target"
+
+                # Attempt merge
+                if ! git merge --no-ff --no-edit "origin/$CURRENT_BRANCH"; then
+                  echo ""
+                  echo "##vso[task.logissue type=warning]MERGE CONFLICT: '$CURRENT_BRANCH' → '$target'. Manual resolution required."
+                  echo ""
+                  echo "To resolve manually:"
+                  echo "  git checkout $target"
+                  echo "  git pull origin $target"
+                  echo "  git merge origin/$CURRENT_BRANCH"
+                  echo "  # resolve conflicts"
+                  echo "  git push origin $target"
+                  echo ""
+                  git merge --abort || true
+                  MERGE_FAILED=true
+                  continue
+                fi
+
+                # Push merged changes
+                echo "Pushing to origin/$target..."
+                git push origin "HEAD:refs/heads/$target"
+                echo "✓ Successfully merged '$CURRENT_BRANCH' → '$target'"
+                echo ""
+              done
+
+              if [ "$MERGE_FAILED" = true ]; then
+                echo "##vso[task.complete result=SucceededWithIssues;]Some merges had conflicts"
+              else
+                echo "============================================"
+                echo "MERGE-DOWN COMPLETE"
+                echo "============================================"
+              fi
+            displayName: 'Merge and push to downstream'

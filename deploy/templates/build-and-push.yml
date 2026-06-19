@@ -1,0 +1,36 @@
+# Shared Template: Build & Push Docker Image
+# Usage: 
+#   - template: deploy/templates/build-and-push.yml
+#     parameters:
+#       containerRegistry: 'your-registry'
+#       imageName: 'your-image'
+#       dockerfilePath: '**/Dockerfile'
+
+parameters:
+  - name: containerRegistry
+    type: string
+  - name: imageName
+    type: string
+  - name: dockerfilePath
+    type: string
+    default: '**/Dockerfile'
+  - name: tags
+    type: string
+    default: '$(Build.BuildId)'
+
+stages:
+  - stage: Build
+    displayName: Build & Push Images
+    jobs:
+      - job: BuildAndPush
+        displayName: Build & Push
+        steps:
+          - task: Docker@2
+            displayName: 'Build and Push Docker Image'
+            inputs:
+              command: 'buildAndPush'
+              containerRegistry: '${{ parameters.containerRegistry }}'
+              repository: '${{ parameters.imageName }}'
+              Dockerfile: '${{ parameters.dockerfilePath }}'
+              tags: |
+                ${{ parameters.tags }}

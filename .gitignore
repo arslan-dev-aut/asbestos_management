@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment
+.env
+.env.local
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+
+# IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/mcp.json
+.idea/
+
+# Claude Code local settings
+.claude/settings.local.json
+.claude/agent-memory-local/
+
+# OS
+.DS_Store
+Thumbs.db

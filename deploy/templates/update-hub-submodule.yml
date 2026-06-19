@@ -1,0 +1,33 @@
+# Shared Template: Update Hub Submodule
+# Usage:
+#   - template: deploy/templates/update-hub-submodule.yml
+#     parameters:
+#       scriptPath: 'deploy/scripts/update-hub-submodule.sh'
+#       dependsOn: ['DeployMain', 'DeployNonMain']
+
+parameters:
+  - name: scriptPath
+    type: string
+    default: 'deploy/scripts/update-hub-submodule.sh'
+  - name: dependsOn
+    type: object
+    default: []
+  - name: condition
+    type: string
+    default: 'succeeded()'
+
+stages:
+  - stage: UpdateAutomationsHub
+    displayName: 'Update Container-Automations-Hub Submodule'
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    jobs:
+      - job: UpdateHub
+        displayName: 'Create/Update submodule in hub'
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          - bash: |
+              bash "$(Build.SourcesDirectory)/${{ parameters.scriptPath }}"
+            displayName: 'Update hub submodule pointer'
