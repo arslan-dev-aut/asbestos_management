@@ -395,6 +395,26 @@ class MainSubSysClient:
         except (TypeError, ValueError) as exc:
             raise UpstreamError("MainSubSys returned a malformed site id.", detail=str(auto_id)) from exc
 
+    async def get_site_unique_id_by_auto_id(self, auto_id: int) -> str | None:
+        """Resolve an integer site auto-ID to its UniqueId (GUID).
+
+        Returns None if the site cannot be found, so callers can handle the
+        absence without raising — useful when resolving multiple candidates.
+        """
+        try:
+            async with JicroClient() as client:
+                result = await client.execute(
+                    tenant_id=self._tenant_id,
+                    service_name="core",
+                    message_signature="GetSiteByIdMsg",
+                    payload={"Id": auto_id},
+                )
+            obj = (result or {}).get("jicroResponse") or {}
+            unique_id = obj.get("UniqueId") or obj.get("uniqueId")
+            return str(unique_id) if unique_id else None
+        except JicroError:
+            return None
+
     # ------------------------------------------------------------------ #
     # Customer / site listing (for lookup dropdowns)
     # ------------------------------------------------------------------ #

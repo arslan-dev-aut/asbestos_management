@@ -33,6 +33,9 @@ qrcode[pil]==8.0
 PyJWT[crypto]==2.10.1
 cryptography==44.0.2
 
+# ---- SQL Server (pymssql ships pre-compiled wheels; no system ODBC driver needed) ----
+pymssql==2.3.4
+
 # ---- Tests ----
 pytest==8.3.4
 pytest-asyncio==0.25.0

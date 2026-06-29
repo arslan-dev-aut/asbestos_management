@@ -96,6 +96,15 @@ class Settings(BaseSettings):
     # Public QR endpoint: per-IP rate limit (requests/minute).
     public_rate_limit_per_minute: int = Field(default=30, gt=0)
 
+    # ---- SQL Server (subcontractor mapping database) ----
+    sqlserver_host: str = Field(default="")
+    sqlserver_port: int = Field(default=1433)
+    sqlserver_database: str = Field(default="")
+    sqlserver_user: str = Field(default="")
+    sqlserver_password: str = Field(default="")
+    sqlserver_mapping_table: str = Field(default="SubContractor.SiteMapping")
+    sqlserver_tenant_mapping_table: str = Field(default="SubContractor.TenantMapping")
+
     # ---- CORS ----
     cors_allow_origins: str = Field()
 

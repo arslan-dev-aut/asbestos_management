@@ -32,6 +32,7 @@ from backend.domains.lookup.lookup_router import router as lookup_router
 from backend.domains.mobile.mobile_router import router as mobile_router
 from backend.domains.qrcode.qrcode_router import public_router
 from backend.domains.qrcode.qrcode_router import router as qrcode_router
+from backend.domains.asbestos_sites.asbestos_sites_router import router as asbestos_sites_router
 from backend.domains.register.register_router import router as register_router
 from backend.middleware.auth_introspect import TokenIntrospectionMiddleware, close_http_session
 
