@@ -1,6 +1,39 @@
-joblogic-automation-sdk
-fastapi
-uvicorn[standard]
-apscheduler
-pytest
-pytest-asyncio
+# ---- Web framework ----
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# ---- Database (async SQLAlchemy + asyncpg) ----
+SQLAlchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+greenlet==3.1.1
+
+# ---- Azure Entra (token-based) auth for PostgreSQL ----
+azure-identity==1.19.0
+
+# ---- Config & validation ----
+pydantic==2.10.4
+pydantic-settings==2.7.0
+
+# ---- JobLogic Automation SDK (auth get_tenant_id + Azure App Config loader) ----
+# Repo convention: tenant extraction and production credential loading come from
+# the SDK. [all] includes the App Configuration extra.
+joblogic-automation-sdk[all]
+
+# ---- File storage (Azure Blob Storage) ----
+azure-storage-blob==12.24.0
+
+# ---- Bulk import / export (CSV / XLSX) ----
+openpyxl==3.1.5
+
+# ---- QR code generation ----
+qrcode[pil]==8.0
+
+# ---- JWT validation (local JWKS-based signature verification) ----
+PyJWT[crypto]==2.10.1
+cryptography==44.0.2
+
+# ---- Tests ----
+pytest==8.3.4
+pytest-asyncio==0.25.0
+aiosqlite==0.20.0

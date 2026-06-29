@@ -1,8 +1,8 @@
 {
   "_comment": "target_port: From Dockerfile, app_type: WebApp or AUT, customer_name: From container-automations-hub",
   "is_timer": false,
-  "cron_expression": "0 0 * * *",
-  "customer_name": "",
-  "app_type": "",
-  "target_port": 
+  "cron_expression": "",
+  "customer_name": "linaker",
+  "app_type": "AUT",
+  "target_port": 8000
 }

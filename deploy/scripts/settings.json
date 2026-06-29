@@ -1,6 +1,6 @@
 {
-  "trigger_type": "Schedule",
-  "cpu": 0.25,
-  "memory": "0.5Gi",
-  "min_replicas": ""
+  "trigger_type": "Manual",
+  "cpu": 0.5,
+  "memory": "1.0Gi",
+  "min_replicas": "1"
 }
