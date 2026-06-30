@@ -28,12 +28,3 @@ class AuditListResponse(ApiResponse):
     totalCount: int
 
 
-class AuditTypeOption(BaseModel):
-    auditType: str
-    actions: list[str]
-
-
-class AuditTaxonomyResponse(ApiResponse):
-    """Drives the dependent Audit Type / Action dropdowns in the UI."""
-
-    taxonomy: list[AuditTypeOption]

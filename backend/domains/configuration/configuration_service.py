@@ -105,17 +105,12 @@ async def list_types(
 async def create_type(
     session: AsyncSession, kind: _Kind, *, name: str, tenant_id: str, user_id: str
 ) -> ConfigType:
-    import time as _time
-    _t0 = _time.perf_counter()
-
     name = name.strip()
     if not name:
         raise ValidationError("Name is required.")
 
     if await type_exists(session, kind, name=name, tenant_id=tenant_id):
         raise DuplicateError(f"A type named '{name}' already exists.")
-    _t1 = _time.perf_counter()
-    print(f"[TIMING] type_exists SELECT + duplicate check: {(_t1 - _t0) * 1000:.1f} ms")
 
     row = kind.model(
         tenant_id=uuid.UUID(tenant_id),
@@ -126,8 +121,6 @@ async def create_type(
     )
     session.add(row)
     await session.flush()
-    _t2 = _time.perf_counter()
-    print(f"[TIMING] INSERT + flush: {(_t2 - _t1) * 1000:.1f} ms")
 
     await audit_service.record(
         session,
@@ -137,15 +130,7 @@ async def create_type(
         action=kind.added,
         details={"name": name, "typeId": str(row.id)},
     )
-    _t3 = _time.perf_counter()
-    print(f"[TIMING] audit record + flush: {(_t3 - _t2) * 1000:.1f} ms")
-
     await session.commit()
-    _t4 = _time.perf_counter()
-    print(f"[TIMING] commit: {(_t4 - _t3) * 1000:.1f} ms")
-
-    # No session.refresh() needed — expire_on_commit=False keeps attributes valid.
-    print(f"[TIMING] create_type TOTAL (no refresh): {(_t4 - _t0) * 1000:.1f} ms")
     return _to_schema(row)
 
 

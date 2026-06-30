@@ -599,7 +599,9 @@ async def attachment_download_url(
 
 
 async def _entry_to_active_view(
-    entry: AsbestosAcmEntries, resolved_assets: dict[str, str | None]
+    entry: AsbestosAcmEntries,
+    resolved_assets: dict[str, str | None],
+    resolved_users: dict[str, str | None],
 ) -> "ActiveAcmEntryView":
     from backend.core import rag as _rag
     from backend.domains.acm_entries.acm_entries_models import (
@@ -621,12 +623,16 @@ async def _entry_to_active_view(
         roomLocation=entry.room_location,
         assetId=str(entry.asset_id) if entry.asset_id else None,
         assetName=resolved_assets.get(str(entry.asset_id)) if entry.asset_id else None,
+        assetDiscrepancy=entry.asset_discrepancy,
         acmType=entry.acm_type.name if entry.acm_type else None,
         condition=entry.condition,
         riskScore=entry.risk_score,
         riskRag=_rag.risk_rag(entry.risk_score).value,
         notes=entry.notes,
         status=entry.status,
+        updatedAt=entry.updated_at,
+        updatedBy=str(entry.updated_by),
+        updatedByName=resolved_users.get(str(entry.updated_by)),
         attachments=attachments,
     )
 
@@ -650,7 +656,7 @@ async def list_active_entries(
     from backend.domains.acm_entries.acm_entries_models import ActiveAcmEntriesResponse
 
     page = max(0, page)
-    page_size = max(1, min(page_size, 100))
+    page_size = max(1, min(page_size, 50))
 
     await _require_site(session, site_id, tenant_id)
 
@@ -683,20 +689,58 @@ async def list_active_entries(
     )
 
     asset_ids = {str(e.asset_id) for e in entries if e.asset_id}
+    user_ids = {str(e.updated_by) for e in entries}
     resolved_assets: dict[str, str | None] = {}
-    if asset_ids:
+    resolved_users: dict[str, str | None] = {}
+    if asset_ids or user_ids:
         from backend.integrations.mainsubsys import MainSubSysClient
 
         async with MainSubSysClient(tenant_id) as mss:
-            resolved = await mss.resolve_all(asset_ids=asset_ids, user_ids=set())
+            resolved = await mss.resolve_all(asset_ids=asset_ids, user_ids=user_ids)
             resolved_assets = {aid: resolved.asset(aid) for aid in asset_ids}
+            resolved_users = {uid: resolved.user(uid) for uid in user_ids}
 
-    views = [await _entry_to_active_view(e, resolved_assets) for e in entries]
+    # Detect and persist asset discrepancy changes.
+    # An asset resolving to None means it is no longer active/linked in Joblogic.
+    dirty = False
+    for e in entries:
+        if e.asset_id:
+            discrepancy = resolved_assets.get(str(e.asset_id)) is None
+            if discrepancy != e.asset_discrepancy:
+                e.asset_discrepancy = discrepancy
+                dirty = True
+    if dirty:
+        await session.commit()
+
+    views = [await _entry_to_active_view(e, resolved_assets, resolved_users) for e in entries]
     return ActiveAcmEntriesResponse(
         acmEntries=views,
         totalCount=int(total_count or 0),
         page=page,
         pageSize=page_size,
+    )
+
+
+async def check_asset_acm_link(
+    session: AsyncSession, *, tenant_id: str, asset_id: str
+):
+    """Return whether a JobLogic asset is linked to any active ACM entry for this tenant."""
+    from sqlalchemy import func
+
+    from backend.domains.acm_entries.acm_entries_models import AssetAcmLinkResponse
+
+    count = await session.scalar(
+        select(func.count()).where(
+            AsbestosAcmEntries.tenant_id == uuid.UUID(tenant_id),
+            AsbestosAcmEntries.asset_id == uuid.UUID(asset_id),
+            AsbestosAcmEntries.status == "ACTIVE",
+        )
+    )
+    active_count = int(count or 0)
+    return AssetAcmLinkResponse(
+        assetId=asset_id,
+        linked=active_count > 0,
+        activeEntryCount=active_count,
     )
 
 
@@ -737,13 +781,27 @@ async def get_asset_acm_mapping(
     )
 
     asset_ids = {str(e.asset_id) for e in entries}
+    user_ids = {str(e.updated_by) for e in entries}
     resolved_assets: dict[str, str | None] = {}
-    if asset_ids:
+    resolved_users: dict[str, str | None] = {}
+    if asset_ids or user_ids:
         from backend.integrations.mainsubsys import MainSubSysClient
 
         async with MainSubSysClient(tenant_id) as mss:
-            resolved = await mss.resolve_all(asset_ids=asset_ids, user_ids=set())
+            resolved = await mss.resolve_all(asset_ids=asset_ids, user_ids=user_ids)
             resolved_assets = {aid: resolved.asset(aid) for aid in asset_ids}
+            resolved_users = {uid: resolved.user(uid) for uid in user_ids}
+
+    # Detect and persist asset discrepancy changes.
+    dirty = False
+    for e in entries:
+        if e.asset_id:
+            discrepancy = resolved_assets.get(str(e.asset_id)) is None
+            if discrepancy != e.asset_discrepancy:
+                e.asset_discrepancy = discrepancy
+                dirty = True
+    if dirty:
+        await session.commit()
 
     # Group by asset_id preserving insertion order.
     grouped: dict[str, list] = {}
@@ -751,7 +809,7 @@ async def get_asset_acm_mapping(
         aid = str(entry.asset_id)
         if aid not in grouped:
             grouped[aid] = []
-        grouped[aid].append(await _entry_to_active_view(entry, resolved_assets))
+        grouped[aid].append(await _entry_to_active_view(entry, resolved_assets, resolved_users))
 
     mapping = [
         AssetAcmItem(

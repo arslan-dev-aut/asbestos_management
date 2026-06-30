@@ -80,13 +80,16 @@ async def confirm_bulk(
 ) -> BulkConfirmResponse:
     validate_nonempty(body.uploadToken, "uploadToken")
     try:
-        imported, created = await bulk_service.confirm(
+        created_entries, not_created, created_sites, skipped = await bulk_service.confirm(
             session, tenant_id=ctx.tenant_id, token=body.uploadToken, user_id=ctx.user_id
         )
         return BulkConfirmResponse(
-            importedEntries=imported,
-            createdSites=created,
-            message=f"Imported {imported} entries; created {created} site(s).",
+            createdEntries=created_entries,
+            notCreatedEntries=not_created,
+            skippedEntries=skipped,
+            createdSites=created_sites,
+            message=f"Created {created_entries} ACM entries and {created_sites} new site(s)."
+            + (f" {not_created} entry/entries could not be created." if not_created else ""),
         )
     except DomainError:
         raise

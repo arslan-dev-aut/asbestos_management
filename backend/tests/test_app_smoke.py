@@ -1,8 +1,7 @@
-"""App-level smoke tests: routing, health, audit taxonomy (no DB hits)."""
+"""App-level smoke tests: routing and health (no DB hits)."""
 
 from fastapi.testclient import TestClient
 
-from backend.core.enums import AUDIT_ACTIONS_BY_TYPE
 from backend.main import app
 
 client = TestClient(app)
@@ -53,19 +52,6 @@ def test_health_returns_healthy():
     assert resp.json() == {"status": "healthy"}
 
 
-def test_audit_taxonomy_requires_tenant_and_returns_all_types():
-    # Dev fallback is on; tenant header stands in for a token.
-    resp = client.get(
-        "/api/v1/asbestos/audit/taxonomy",
-        headers={"X-Tenant-Id": "11111111-1111-1111-1111-111111111111"},
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["success"] is True
-    returned_types = {opt["auditType"] for opt in body["taxonomy"]}
-    assert returned_types == {t.value for t in AUDIT_ACTIONS_BY_TYPE}
-
-
 def test_protected_route_without_auth_is_rejected():
-    resp = client.get("/api/v1/asbestos/audit/taxonomy")
+    resp = client.get("/api/v1/asbestos/register")
     assert resp.status_code == 401

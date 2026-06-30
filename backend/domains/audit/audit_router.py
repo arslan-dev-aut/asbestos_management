@@ -9,26 +9,10 @@ from backend.core.validation import validate_uuid
 from backend.database.exceptions import DomainError, UpstreamError
 from backend.database.postgres import get_session
 from backend.domains.audit import audit_service
-from backend.domains.audit.audit_models import (
-    AuditListResponse,
-    AuditTaxonomyResponse,
-)
+from backend.domains.audit.audit_models import AuditListResponse
 from backend.middleware.auth import AuthContext, get_context
 
 router = APIRouter(tags=["audit"])
-
-
-@router.get("/audit/taxonomy", response_model=AuditTaxonomyResponse)
-async def get_audit_taxonomy(
-    _ctx: AuthContext = Depends(get_context),
-) -> AuditTaxonomyResponse:
-    """Audit Type + dependent Action options for the Audit Trail filters."""
-    try:
-        return AuditTaxonomyResponse(taxonomy=audit_service.taxonomy())
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to retrieve audit taxonomy.", detail=str(exc)) from exc
 
 
 @router.get("/audit/config", response_model=AuditListResponse)

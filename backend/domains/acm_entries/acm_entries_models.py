@@ -107,12 +107,16 @@ class ActiveAcmEntryView(BaseModel):
     roomLocation: str
     assetId: str | None = None
     assetName: str | None = None
+    assetDiscrepancy: bool = False
     acmType: str | None = None
     condition: str
     riskScore: str
     riskRag: str
     notes: str | None = None
     status: str
+    updatedAt: datetime
+    updatedBy: str
+    updatedByName: str | None = None
     attachments: list[ActiveAcmAttachmentView] = Field(default_factory=list)
 
 
@@ -131,3 +135,9 @@ class AssetAcmItem(BaseModel):
 
 class AssetAcmMappingResponse(ApiResponse):
     mapping: list[AssetAcmItem]
+
+
+class AssetAcmLinkResponse(ApiResponse):
+    assetId: str
+    linked: bool
+    activeEntryCount: int

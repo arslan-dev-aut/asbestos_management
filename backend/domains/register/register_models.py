@@ -89,5 +89,6 @@ class SiteExistsResponse(ApiResponse):
 
 
 class SiteAsbestosStatusResponse(ApiResponse):
+    asbestosSiteId: str | None = None
     hasActiveAcm: bool
     activeAcmCount: int

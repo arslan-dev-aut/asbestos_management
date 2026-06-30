@@ -495,7 +495,7 @@ async def list_documents_paginated(
     await _require_site(session, site_id, tenant_id)
 
     page = max(0, page)
-    page_size = max(1, min(page_size, 100))
+    page_size = max(1, min(page_size, 50))
 
     all_docs = await list_for_site(session, site_id=site_id)
     total = len(all_docs)

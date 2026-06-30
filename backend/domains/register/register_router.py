@@ -186,17 +186,20 @@ async def create_site(
         raise UpstreamError("Failed to create site.", detail=str(exc)) from exc
 
 
-@router.get("/{asbestos_site_id}/asbestos-status", response_model=SiteAsbestosStatusResponse)
+@router.get("/{site_id}/asbestos-status", response_model=SiteAsbestosStatusResponse)
 async def get_asbestos_status(
-    asbestos_site_id: str,
+    site_id: str,
     ctx: AuthContext = Depends(get_context),
     session: AsyncSession = Depends(get_session),
 ) -> SiteAsbestosStatusResponse:
-    """Whether the site has any active ACM entries and how many."""
-    validate_uuid(asbestos_site_id, "asbestosSiteId")
+    """Whether the site has any active ACM entries and how many.
+
+    ``site_id`` is the external Joblogic site UUID.
+    """
+    validate_uuid(site_id, "siteId")
     try:
         return await svc.get_asbestos_status(
-            session, tenant_id=ctx.tenant_id, site_id=asbestos_site_id
+            session, tenant_id=ctx.tenant_id, site_id=site_id
         )
     except DomainError:
         raise

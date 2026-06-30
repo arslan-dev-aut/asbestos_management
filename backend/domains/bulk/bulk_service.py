@@ -42,7 +42,7 @@ from backend.database.db_models import (
 )
 from backend.database.exceptions import ValidationError
 from backend.domains.audit import audit_service
-from backend.domains.bulk.bulk_models import BulkUploadRow
+from backend.domains.bulk.bulk_models import BulkUploadRow, SkippedEntry, SiteToCreate
 from backend.domains.qrcode import qrcode_service
 from backend.integrations.mainsubsys import MainSubSysClient
 
@@ -81,14 +81,16 @@ class _RowParsed:
 
 @dataclass
 class _PlanRow:
+    row_index: int
     customer_id: str
     site_id: str
-    building_type_id: str
-    room_location: str
+    # ACM fields are None for site-only rows (Case 2)
+    building_type_id: str | None
+    room_location: str | None
     asset_id: str | None
-    acm_type_id: str
-    condition: str
-    risk_score: str
+    acm_type_id: str | None
+    condition: str | None
+    risk_score: str | None
     notes: str | None
 
 
@@ -224,8 +226,7 @@ async def validate(
             fmt_errors.append("Customer ID is required")
         else:
             try:
-                uuid.UUID(customer_id_raw)
-                customer_id = customer_id_raw
+                customer_id = str(uuid.UUID(customer_id_raw))  # normalize to lowercase
             except ValueError:
                 fmt_errors.append("Customer ID is not a valid UUID")
 
@@ -234,8 +235,7 @@ async def validate(
             fmt_errors.append("Site ID is required")
         else:
             try:
-                uuid.UUID(site_id_raw)
-                site_id = site_id_raw
+                site_id = str(uuid.UUID(site_id_raw))  # normalize to lowercase
             except ValueError:
                 fmt_errors.append("Site ID is not a valid UUID")
 
@@ -271,10 +271,35 @@ async def validate(
         for name in unique_asset_names:
             asset_cache[name] = await mss.find_asset_by_name(name)
 
-    # Phase 3: apply remaining validation and build output rows + plan.
+    # Phase 2b: check which site IDs already exist in the register (DB).
+    all_site_id_uuids = [uuid.UUID(p.site_id) for p in parsed_rows if p.site_id]
+    existing_in_db: set[str] = set()
+    if all_site_id_uuids:
+        existing_in_db = {
+            str(s)
+            for s in (
+                await session.scalars(
+                    select(AsbestosSites.site_id).where(
+                        AsbestosSites.tenant_id == uuid.UUID(tenant_id),
+                        AsbestosSites.site_id.in_(all_site_id_uuids),
+                    )
+                )
+            ).all()
+        }
+
+
+    # Phase 3: case-based validation and plan construction.
+    #
+    # Case 1: site in DB  + no ACM data  → INVALID  (redundant site, nothing to do)
+    # Case 2: site NOT DB + no ACM data  → VALID    (create site only)
+    # Case 3: site in DB  + ACM data     → VALID    (create ACM entry only)
+    # Case 4: site NOT DB + ACM data     → VALID    (create site + ACM entry)
     out_rows: list[BulkUploadRow] = []
     plan = _Plan(expires_at=time.time() + _TOKEN_TTL_SECONDS)
-    sites_to_create_names: dict[str, str] = {}  # site_id -> display name
+    new_site_info: dict[str, tuple[str | None, str | None]] = {}
+
+    allowed_conditions = list(Condition.__members__.values())
+    allowed_risks = list(RiskScore.__members__.values())
 
     for idx, p in enumerate(parsed_rows):
         errors: list[str] = list(p.format_errors)
@@ -283,35 +308,78 @@ async def validate(
         site_id = p.site_id
 
         if customer_id and customer_id not in resolved_customers:
-            errors.append("Customer ID not found in system")
+            errors.append(f"Customer ID '{customer_id}' was not found in the system")
         if site_id and site_id not in resolved_sites:
-            errors.append("Site ID not found in system")
+            errors.append(f"Site ID '{site_id}' was not found in the system")
 
-        # Prefer the name resolved from the ID; fall back to file text columns.
         display_customer = resolved_customers.get(customer_id, p.customer_name) if customer_id else p.customer_name
         display_site = resolved_sites.get(site_id, p.site_name) if site_id else p.site_name
 
-        building_id = building_by_name.get(p.building.strip().lower())
-        if not building_id:
-            errors.append("Building type not found")
+        site_in_db = bool(site_id and site_id in existing_in_db)
 
-        acm_type_id = acm_by_name.get(p.acm_type.strip().lower())
-        if not acm_type_id:
-            errors.append("ACM Type not found")
+        # Determine whether ACM data is present in this row.
+        acm_raw_fields = [p.building, p.room, p.acm_type, p.condition_raw, p.risk_raw]
+        has_acm_data = any(f.strip() for f in acm_raw_fields)
+        has_full_acm_data = all(f.strip() for f in acm_raw_fields)
 
-        condition = _parse_condition(p.condition_raw)
-        if condition is None:
-            errors.append("Invalid Condition")
+        # Case 1: site already exists but no ACM data provided — nothing to do.
+        if not errors and site_in_db and not has_acm_data:
+            errors.append(
+                "Site already exists in the register. "
+                "Provide ACM entry details (Building, Room, ACM Type, Condition, Risk Score) to add entries."
+            )
 
-        risk = _parse_risk(p.risk_raw)
-        if risk is None:
-            errors.append("Invalid Risk Score")
+        # Partial ACM data — some fields filled, some missing.
+        if not errors and has_acm_data and not has_full_acm_data:
+            missing = [
+                name for name, val in zip(
+                    ["Building", "Room/Location", "ACM Type", "Condition", "Risk Score"],
+                    acm_raw_fields,
+                ) if not val.strip()
+            ]
+            errors.append(
+                f"Incomplete ACM data. Missing: {', '.join(missing)}. "
+                "All ACM fields are required when providing ACM details."
+            )
 
-        if p.notes and len(p.notes) > get_settings().notes_max_length:
-            errors.append("Notes exceed 250 characters")
+        # ACM field validation — only when full ACM data is present and no prior errors.
+        building_id: str | None = None
+        acm_type_id: str | None = None
+        condition: str | None = None
+        risk: str | None = None
+        asset_id: str | None = None
 
-        # Asset is optional and best-effort (not an error if unresolved).
-        asset_id: str | None = asset_cache.get(p.asset) if p.asset else None
+        if not errors and has_full_acm_data:
+            building_id = building_by_name.get(p.building.strip().lower())
+            if not building_id:
+                errors.append(f"Building type '{p.building}' is not configured for this tenant")
+
+            acm_type_id = acm_by_name.get(p.acm_type.strip().lower())
+            if not acm_type_id:
+                errors.append(f"ACM type '{p.acm_type}' is not configured for this tenant")
+
+            condition = _parse_condition(p.condition_raw)
+            if condition is None:
+                errors.append(
+                    f"Condition '{p.condition_raw}' is not valid. "
+                    f"Allowed values: {', '.join(allowed_conditions)}"
+                )
+
+            risk = _parse_risk(p.risk_raw)
+            if risk is None:
+                errors.append(
+                    f"Risk Score '{p.risk_raw}' is not valid. "
+                    f"Allowed values: {', '.join(allowed_risks)}"
+                )
+
+            if p.notes and len(p.notes) > get_settings().notes_max_length:
+                errors.append(
+                    f"Notes exceed the maximum of {get_settings().notes_max_length} characters "
+                    f"({len(p.notes)} provided)"
+                )
+
+            # Asset is optional and best-effort.
+            asset_id = asset_cache.get(p.asset) if p.asset else None
 
         status = "ERROR" if errors else "VALID"
         out_rows.append(
@@ -334,37 +402,31 @@ async def validate(
         if status == "VALID":
             plan.rows.append(
                 _PlanRow(
+                    row_index=idx,
                     customer_id=customer_id,
                     site_id=site_id,
+                    # None signals a site-only row (Case 2) — no ACM entry to create.
                     building_type_id=building_id,
-                    room_location=p.room,
+                    room_location=p.room if has_full_acm_data else None,
                     asset_id=asset_id,
                     acm_type_id=acm_type_id,
                     condition=condition,
                     risk_score=risk,
-                    notes=p.notes,
+                    notes=p.notes if has_full_acm_data else None,
                 )
             )
             plan.site_ids.add(site_id)
-            sites_to_create_names.setdefault(site_id, display_site)
+            if not site_in_db:
+                new_site_info.setdefault(site_id, (display_site, display_customer))
 
-    # Which valid sites are not yet in the register?
-    sites_to_create: list[str] = []
-    if plan.site_ids:
-        existing = set(
-            str(s)
-            for s in (
-                await session.scalars(
-                    select(AsbestosSites.site_id).where(
-                        AsbestosSites.tenant_id == uuid.UUID(tenant_id),
-                        AsbestosSites.site_id.in_([uuid.UUID(s) for s in plan.site_ids]),
-                    )
-                )
-            ).all()
+    sites_to_create = [
+        SiteToCreate(
+            siteId=sid,
+            siteName=info[0],
+            customerName=info[1],
         )
-        sites_to_create = [
-            sites_to_create_names[sid] for sid in plan.site_ids if sid not in existing
-        ]
+        for sid, info in new_site_info.items()
+    ]
 
     valid_count = sum(1 for r in out_rows if r.status == "VALID")
     error_count = len(out_rows) - valid_count
@@ -378,7 +440,11 @@ async def validate(
 # ---- confirm ----
 async def confirm(
     session: AsyncSession, *, tenant_id: str, token: str, user_id: str
-) -> tuple[int, int]:
+) -> tuple[int, int, int, list[SkippedEntry]]:
+    """Execute the validated plan.
+
+    Returns (created_entries, not_created_entries, created_sites, skipped).
+    """
     _prune_cache()
     plan = _PLAN_CACHE.pop(token, None)
     if plan is None or plan.expires_at < time.time():
@@ -386,7 +452,7 @@ async def confirm(
 
     uid = uuid.UUID(str(user_id))
 
-    # Ensure all referenced sites exist; create the missing ones.
+    # Build site pk map — create any sites not yet in the register.
     existing_rows = (
         await session.scalars(
             select(AsbestosSites).where(
@@ -400,6 +466,18 @@ async def confirm(
     created_sites = 0
     for plan_row in plan.rows:
         if plan_row.site_id in site_pk_by_site_id:
+            continue
+        # Guard against race: site may have been created after validate ran.
+        already = (
+            await session.scalars(
+                select(AsbestosSites).where(
+                    AsbestosSites.tenant_id == uuid.UUID(tenant_id),
+                    AsbestosSites.site_id == uuid.UUID(plan_row.site_id),
+                )
+            )
+        ).first()
+        if already is not None:
+            site_pk_by_site_id[plan_row.site_id] = already.id
             continue
         site = AsbestosSites(
             tenant_id=uuid.UUID(tenant_id),
@@ -425,9 +503,22 @@ async def confirm(
             session, tenant_id=tenant_id, site_id=str(site.id), user_id=user_id
         )
 
-    imported = 0
+    created_entries = 0
+    skipped: list[SkippedEntry] = []
+
     for plan_row in plan.rows:
-        site_pk = site_pk_by_site_id[plan_row.site_id]
+        site_pk = site_pk_by_site_id.get(plan_row.site_id)
+        if site_pk is None:
+            skipped.append(SkippedEntry(
+                rowIndex=plan_row.row_index,
+                reason=f"Site ID '{plan_row.site_id}' could not be found or created in the register.",
+            ))
+            continue
+
+        # Site-only row (Case 2) — site was just created above, nothing more to do.
+        if plan_row.building_type_id is None:
+            continue
+
         entry = AsbestosAcmEntries(
             tenant_id=uuid.UUID(tenant_id),
             asbestos_site_id=site_pk,
@@ -444,7 +535,7 @@ async def confirm(
         )
         session.add(entry)
         await session.flush()
-        imported += 1
+        created_entries += 1
         await audit_service.record(
             session,
             site_id=str(site_pk),
@@ -464,7 +555,7 @@ async def confirm(
         )
 
     await session.commit()
-    return imported, created_sites
+    return created_entries, len(skipped), created_sites, skipped
 
 
 # ---- export ----

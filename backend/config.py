@@ -34,84 +34,63 @@ class Settings(BaseSettings):
     )
 
     # ---- General ----
-    application_environment: str = Field(default="development")
-    api_base_prefix: str = Field(default="/api/v1/asbestos")
-    project_name: str = Field(default="JobLogic Asbestos Management API")
+    application_environment: str = Field()
+    api_base_prefix: str = Field()
+    project_name: str = Field()
 
     # ---- Azure App Configuration (production credential source) ----
     # In production, AppConfigManager.load() reads Automation/<AUTOMATION_NAME>/*
     # at startup and injects values into the environment. These two vars are set
-    # at the Container App level by the deploy pipeline (deploy/scripts/containerapp.sh).
-    app_configuration_connection_string: str = Field(default="")
-    automation_name: str = Field(default="asbestos-management")
+    # at the Container App level by the deploy pipeline.
+    app_configuration_connection_string: str = Field()
+    automation_name: str = Field()
 
     # ---- Database (Azure PostgreSQL) ----
-    # No connection string is hardcoded. Discrete parts come from config
-    # (local .env / Azure App Config). Default auth is Entra (token) — an
-    # access token is fetched at connect time and used as the password.
-    db_host: str = Field(default="")
-    db_port: int = Field(default=5432)
-    db_name: str = Field(default="automation-asbestos")
-    db_user: str = Field(default="")  # AAD principal / Postgres role name
-    db_ssl_mode: str = Field(default="require")  # Azure requires SSL
-    db_auth_mode: str = Field(default="aad_token")  # aad_token | password
-    # Entra token settings (aad_token mode):
-    aad_token_scope: str = Field(default="https://ossrdbms-aad.database.windows.net/.default")
-    # User-assigned managed identity client id (set by the deploy pipeline in prod).
-    azure_client_id: str = Field(default="")
-    # Optional full URL for local password-mode dev only (never committed):
-    database_url: str = Field(default="")
-    db_echo: bool = Field(default=False)
-    db_pool_size: int = Field(default=5)
-    db_max_overflow: int = Field(default=10)
+    db_host: str = Field()
+    db_port: int = Field()
+    db_name: str = Field()
+    db_user: str = Field()
+    db_ssl_mode: str = Field()
+    db_auth_mode: str = Field()  # aad_token | password
+    aad_token_scope: str = Field()
+    azure_client_id: str = Field()
+    database_url: str = Field()  # optional: full URL for local password-mode dev
+    db_echo: bool = Field()
+    db_pool_size: int = Field()
+    db_max_overflow: int = Field()
 
     # ---- Auth (OIDC / JobLogic Identity Server) ----
-    # Multi-tenant marketplace pattern (per repo conventions): the tenant is
-    # taken from the X-Tenant-Id header via joblogic_sdk.auth.get_tenant_id; the
-    # acting user is the `sub` claim of the (gateway/SDK-validated) bearer token.
-    idp_client_id: str = Field(default="")
-    idp_authority: str = Field(default="")
-    idp_client_secret: str = Field(default="")  # required for token introspection
-    jwt_user_claim: str = Field(default="sub")
-    # URL to redirect to when a token is missing or rejected by the IDP.
-    introspect_redirect_url: str = Field(default="https://example.com/unauthorised")
-    # Local dev fallback: trust the X-Tenant-Id header without a bearer token.
-    auth_dev_fallback: bool = Field(default=False)
-    # Actual DB user ID used as last resort when auth_dev_fallback is True and
-    # no bearer token is present. Must be set explicitly — no default GUID.
-    dev_user_id: str = Field(default="")
+    idp_client_id: str = Field()
+    idp_authority: str = Field()
+    idp_client_secret: str = Field()
+    jwt_user_claim: str = Field()
+    introspect_redirect_url: str = Field()
+    auth_dev_fallback: bool = Field()
+    dev_user_id: str = Field()
 
     # ---- User identity resolution ----
-    # Base URL of the JobLogic internal API used to map an IDP identity user ID
-    # (the `sub` claim) to the actual user UniqueId stored in the database.
-    # user_detail_api_base_url: str = Field(
-    #     default="https://jllivemarketappinternalapi.azurewebsites.net"
-    # )
-    user_detail_api_base_url: str = Field(
-        default="https://uat-marketappapi.joblogicinternal.com"
-    )
-    
+    user_detail_api_base_url: str = Field()
 
     # ---- Azure Blob Storage ----
-    # Default auth is Entra/managed identity (account URL + DefaultAzureCredential),
-    # consistent with the DB. A connection string may be supplied for local dev.
-    azure_storage_account_url: str = Field(default="")  # https://<acct>.blob.core.windows.net
-    azure_storage_container: str = Field(default="asbestos-documents")
-    azure_storage_connection_string: str = Field(default="")  # optional (local dev)
-    blob_sas_expiry_seconds: int = Field(default=900)
-    storage_public_base_url: str = Field(default="")  # optional CDN/base for qr images
+    azure_storage_account_url: str = Field()
+    azure_storage_container: str = Field()
+    azure_storage_connection_string: str = Field()  # optional: local dev only
+    blob_sas_expiry_seconds: int = Field()
+    storage_public_base_url: str = Field()  # optional: CDN/base for QR images
 
     # ---- Public QR page ----
-    public_base_url: str = Field(default="http://localhost:8000")
+    public_base_url: str = Field()
 
     # ---- Business rules ----
-    amp_expiry_warning_days: int = Field(default=30)
-    notes_max_length: int = Field(default=250)
-    notes_truncate_length: int = Field(default=100)
-    max_upload_bytes: int = Field(default=25 * 1024 * 1024)
+    amp_expiry_warning_days: int = Field()
+    notes_max_length: int = Field()
+    notes_truncate_length: int = Field()
+    max_upload_bytes: int = Field()
+    default_page_size: int = Field()
+    max_page_size: int = Field()
 
     # ---- CORS ----
-    cors_allow_origins: str = Field(default="http://localhost:5173,https://go.joblogic.com")
+    cors_allow_origins: str = Field()
 
     @property
     def is_production(self) -> bool:

@@ -12,13 +12,10 @@ import uuid
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.core.enums import AUDIT_ACTIONS_BY_TYPE, AuditAction, AuditType
+from backend.core.enums import AuditAction, AuditType
 from backend.database.db_models import AsbestosAuditLog
 from backend.database.exceptions import ValidationError
-from backend.domains.audit.audit_models import (
-    AuditLogEntry,
-    AuditTypeOption,
-)
+from backend.domains.audit.audit_models import AuditLogEntry
 from backend.integrations.mainsubsys import MainSubSysClient
 
 
@@ -74,7 +71,17 @@ def _build_base_query(
     return base
 
 
-def _to_entry(row: AsbestosAuditLog, names: dict) -> AuditLogEntry:
+def _to_entry(
+    row: AsbestosAuditLog,
+    names: dict,
+    site_names: dict,
+    customer_names: dict,
+) -> AuditLogEntry:
+    details = dict(row.details) if row.details else {}
+    if "siteId" in details:
+        details["siteName"] = site_names.get(details.pop("siteId"))
+    if "customerId" in details:
+        details["customerName"] = customer_names.get(details.pop("customerId"))
     return AuditLogEntry(
         id=str(row.id),
         asbestosSiteId=str(row.asbestos_site_id) if row.asbestos_site_id else None,
@@ -82,7 +89,7 @@ def _to_entry(row: AsbestosAuditLog, names: dict) -> AuditLogEntry:
         userName=names.get(str(row.user_id)),
         auditType=row.audit_type,
         action=row.action,
-        details=row.details,
+        details=details,
         occurredAt=row.occurred_at,
     )
 
@@ -94,7 +101,7 @@ async def _paginate(
     page_index: int,
     page_size: int,
 ) -> tuple[list[AuditLogEntry], int]:
-    page_size = max(1, min(page_size, 100))
+    page_size = max(1, min(page_size, 50))
     page_index = max(0, page_index)
 
     total = await session.scalar(select(func.count()).select_from(base.subquery()))
@@ -105,14 +112,26 @@ async def _paginate(
             .limit(page_size)
         )
     ).all()
-    
-    names: dict[str, str] = {}
-    user_ids = {str(r.user_id) for r in rows}
-    if user_ids:
-        async with MainSubSysClient(tenant_id) as mss:
-            names = await mss.resolve_users(user_ids)
 
-    return [_to_entry(r, names) for r in rows], int(total or 0)
+    user_ids = {str(r.user_id) for r in rows}
+    site_ids = {r.details["siteId"] for r in rows if r.details and "siteId" in r.details}
+    customer_ids = {r.details["customerId"] for r in rows if r.details and "customerId" in r.details}
+
+    names: dict[str, str] = {}
+    site_names: dict[str, str] = {}
+    customer_names: dict[str, str] = {}
+    if user_ids or site_ids or customer_ids:
+        async with MainSubSysClient(tenant_id) as mss:
+            resolved = await mss.resolve_all(
+                user_ids=user_ids,
+                site_ids=site_ids,
+                customer_ids=customer_ids,
+            )
+        names = {uid: resolved.user(uid) for uid in user_ids if resolved.user(uid)}
+        site_names = {sid: resolved.site(sid) for sid in site_ids if resolved.site(sid)}
+        customer_names = {cid: resolved.customer(cid) for cid in customer_ids if resolved.customer(cid)}
+
+    return [_to_entry(r, names, site_names, customer_names) for r in rows], int(total or 0)
 
 
 async def list_for_site(
@@ -153,9 +172,3 @@ async def list_config_logs(
     return await _paginate(session, tenant_id, base, page_index, page_size)
 
 
-def taxonomy() -> list[AuditTypeOption]:
-    """(auditType -> actions) options for the dependent UI dropdowns."""
-    return [
-        AuditTypeOption(auditType=at.value, actions=[a.value for a in actions])
-        for at, actions in AUDIT_ACTIONS_BY_TYPE.items()
-    ]

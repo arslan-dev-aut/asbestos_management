@@ -17,6 +17,7 @@ from backend.domains.acm_entries.acm_entries_models import (
     AcmEntryResponse,
     AcmStatusRequest,
     ActiveAcmEntriesResponse,
+    AssetAcmLinkResponse,
     AssetAcmMappingResponse,
     CreateAcmRequest,
     UpdateAcmRequest,
@@ -190,7 +191,7 @@ async def list_active_acm_entries(
     asbestos_site_id: str,
     statusFilter: str = Query(default="active", pattern="^(active|all)$"),
     page: int = Query(default=0, ge=0),
-    pageSize: int = Query(default=20, ge=1, le=100),
+    pageSize: int = Query(default=10, ge=1, le=50),
     ctx: AuthContext = Depends(get_context),
     session: AsyncSession = Depends(get_session),
 ) -> ActiveAcmEntriesResponse:
@@ -209,6 +210,24 @@ async def list_active_acm_entries(
         raise
     except Exception as exc:
         raise UpstreamError("Failed to retrieve ACM entries.", detail=str(exc)) from exc
+
+
+@router.get("/assets/{asset_id}/check-asset-acm-link", response_model=AssetAcmLinkResponse)
+async def check_asset_acm_link(
+    asset_id: str,
+    ctx: AuthContext = Depends(get_context),
+    session: AsyncSession = Depends(get_session),
+) -> AssetAcmLinkResponse:
+    """Check whether a JobLogic asset is linked to any active ACM entry for this tenant."""
+    validate_uuid(asset_id, "assetId")
+    try:
+        return await svc.check_asset_acm_link(
+            session, tenant_id=ctx.tenant_id, asset_id=asset_id
+        )
+    except DomainError:
+        raise
+    except Exception as exc:
+        raise UpstreamError("Failed to check asset ACM link.", detail=str(exc)) from exc
 
 
 @router.get("/{site_id}/asset-acm-mapping", response_model=AssetAcmMappingResponse)

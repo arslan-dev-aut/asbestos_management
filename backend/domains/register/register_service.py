@@ -132,7 +132,7 @@ async def list_sites(
     if sort_by not in _VALID_SORT:
         sort_by = "lastUpdated"
     descending = sort_dir.lower() != "asc"
-    page_size = max(1, min(page_size, 100))
+    page_size = max(1, min(page_size, 50))
     page_index = max(0, page_index)
 
     # Resolve search text -> customer/site IDs via MainSubSys first.
@@ -247,6 +247,13 @@ async def export_rows(
     if not site_pks:
         return []
 
+    sites = (
+        await session.scalars(
+            select(AsbestosSites).where(AsbestosSites.id.in_(site_pks))
+        )
+    ).all()
+    sites_by_pk = {s.id: s for s in sites}
+
     entries = (
         await session.scalars(
             select(AsbestosAcmEntries)
@@ -260,8 +267,11 @@ async def export_rows(
         )
     ).all()
 
-    customer_id_set = {str(e.site.customer_id) for e in entries}
-    site_id_set = {str(e.site.site_id) for e in entries}
+    # Track which sites have at least one ACM entry
+    sites_with_acm = {e.asbestos_site_id for e in entries}
+
+    customer_id_set = {str(s.customer_id) for s in sites}
+    site_id_set = {str(s.site_id) for s in sites}
     asset_id_set = {str(e.asset_id) for e in entries if e.asset_id}
     user_id_set = {str(e.updated_by) for e in entries}
     async with MainSubSysClient(tenant_id) as mss:
@@ -273,6 +283,23 @@ async def export_rows(
         )
 
     rows: list[list[str]] = []
+
+    # Sites with no ACM entries get a single row with site columns only
+    for site_pk in site_pks:
+        if site_pk not in sites_with_acm:
+            s = sites_by_pk.get(site_pk)
+            if s is None:
+                continue
+            rows.append(
+                [
+                    resolved.customer(str(s.customer_id)) or "",
+                    str(s.customer_id),
+                    resolved.site(str(s.site_id)) or "",
+                    str(s.site_id),
+                    "", "", "", "", "", "", "", "", "",
+                ]
+            )
+
     for e in entries:
         rows.append(
             [
@@ -643,10 +670,22 @@ async def get_detail(
 async def get_asbestos_status(
     session: AsyncSession, *, tenant_id: str, site_id: str
 ) -> "SiteAsbestosStatusResponse":
-    """Return whether a site has active ACM entries and the count."""
+    """Return whether a site has active ACM entries and the count.
+
+    ``site_id`` is the external Joblogic site UUID (AsbestosSites.site_id).
+    """
     from backend.domains.register.register_models import SiteAsbestosStatusResponse
 
-    site = await _load_site(session, site_id, tenant_id)
+    site = (
+        await session.scalars(
+            select(AsbestosSites).where(
+                AsbestosSites.site_id == uuid.UUID(site_id),
+                AsbestosSites.tenant_id == uuid.UUID(tenant_id),
+            )
+        )
+    ).first()
+    if site is None:
+        return SiteAsbestosStatusResponse(hasActiveAcm=False, activeAcmCount=0)
     count = await session.scalar(
         select(func.count()).where(
             AsbestosAcmEntries.asbestos_site_id == site.id,
@@ -654,4 +693,8 @@ async def get_asbestos_status(
         )
     )
     active_count = count or 0
-    return SiteAsbestosStatusResponse(hasActiveAcm=active_count > 0, activeAcmCount=active_count)
+    return SiteAsbestosStatusResponse(
+        asbestosSiteId=str(site.id),
+        hasActiveAcm=active_count > 0,
+        activeAcmCount=active_count,
+    )

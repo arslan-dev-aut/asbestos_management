@@ -43,9 +43,9 @@ async def get_qr(
 async def public_view(
     token: str,
     acmPage: int = Query(default=0, ge=0),
-    acmPageSize: int = Query(default=10, ge=1, le=100),
+    acmPageSize: int = Query(default=10, ge=1, le=50),
     docsPage: int = Query(default=0, ge=0),
-    docsPageSize: int = Query(default=10, ge=1, le=100),
+    docsPageSize: int = Query(default=10, ge=1, le=50),
     session: AsyncSession = Depends(get_session),
 ) -> PublicViewResponse:
     """No authentication — strictly read-only active ACM data + current documents."""

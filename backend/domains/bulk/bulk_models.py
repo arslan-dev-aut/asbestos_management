@@ -22,11 +22,17 @@ class BulkUploadRow(BaseModel):
     notes: str | None = None
 
 
+class SiteToCreate(BaseModel):
+    siteId: str
+    siteName: str | None = None
+    customerName: str | None = None
+
+
 class BulkValidateResponse(ApiResponse):
     rows: list[BulkUploadRow]
     validCount: int
     errorCount: int
-    sitesToCreate: list[str]
+    sitesToCreate: list[SiteToCreate]
     uploadToken: str
 
 
@@ -34,6 +40,13 @@ class BulkConfirmRequest(BaseModel):
     uploadToken: str
 
 
+class SkippedEntry(BaseModel):
+    rowIndex: int
+    reason: str
+
+
 class BulkConfirmResponse(ApiResponse):
-    importedEntries: int
+    createdEntries: int
+    notCreatedEntries: int
+    skippedEntries: list[SkippedEntry]
     createdSites: int

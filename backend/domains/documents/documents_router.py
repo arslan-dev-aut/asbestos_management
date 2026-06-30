@@ -25,7 +25,7 @@ router = APIRouter(prefix="/register", tags=["documents"])
 async def get_site_documents(
     asbestos_site_id: str,
     page: int = Query(default=0, ge=0),
-    pageSize: int = Query(default=20, ge=1, le=100),
+    pageSize: int = Query(default=10, ge=1, le=50),
     ctx: AuthContext = Depends(get_context),
     session: AsyncSession = Depends(get_session),
 ) -> SiteDocumentsPaginatedResponse:
