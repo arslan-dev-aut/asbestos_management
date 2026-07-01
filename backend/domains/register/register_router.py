@@ -18,7 +18,6 @@ from backend.domains.register.register_models import (
     CreateSiteResponse,
     RegisterCustomerListResponse,
     RegisterSiteListResponse,
-    SiteAsbestosStatusResponse,
     SiteDetailResponse,
     SiteExistsResponse,
     SiteListResponse,
@@ -162,19 +161,6 @@ async def create_site(
     )
     return CreateSiteResponse(asbestosSiteId=asbestos_site_id, message="Site registered.")
 
-
-@router.get("/{site_id}/asbestos-status", response_model=SiteAsbestosStatusResponse)
-async def get_asbestos_status(
-    site_id: str,
-    ctx: AuthContext = Depends(get_context),
-    session: AsyncSession = Depends(get_session),
-) -> SiteAsbestosStatusResponse:
-    """Whether the site has any active ACM entries and how many.
-
-    ``site_id`` is the external Joblogic site UUID.
-    """
-    validate_uuid(site_id, "siteId")
-    return await svc.get_asbestos_status(session, tenant_id=ctx.tenant_id, site_id=site_id)
 
 
 @router.get("/{asbestos_site_id}", response_model=SiteDetailResponse)

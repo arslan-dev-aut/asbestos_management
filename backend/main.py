@@ -22,9 +22,6 @@ from backend.config import get_settings
 from backend.core.storage import close_storage
 from backend.database.exceptions import DomainError
 from backend.database.postgres import dispose_engine, get_engine
-from backend.middleware.auth_introspect import TokenIntrospectionMiddleware, close_http_session
-
-logger = logging.getLogger("asbestos")
 from backend.domains.acm_entries.acm_entries_router import router as acm_entries_router
 from backend.domains.audit.audit_router import router as audit_router
 from backend.domains.bulk.bulk_router import router as bulk_router
@@ -32,9 +29,14 @@ from backend.domains.configuration.configuration_router import router as configu
 from backend.domains.documents.documents_router import router as documents_router
 from backend.domains.files.files_router import router as files_router
 from backend.domains.lookup.lookup_router import router as lookup_router
+from backend.domains.mobile.mobile_router import router as mobile_router
 from backend.domains.qrcode.qrcode_router import public_router
 from backend.domains.qrcode.qrcode_router import router as qrcode_router
 from backend.domains.register.register_router import router as register_router
+from backend.middleware.auth_introspect import TokenIntrospectionMiddleware, close_http_session
+
+logger = logging.getLogger("asbestos")
+
 
 def _load_app_config_eagerly() -> None:
     """Load Automation/<name>/* from Azure App Config into the environment BEFORE
@@ -96,7 +98,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title=settings.project_name,
-    description="B6 Asbestos Management — contractor back-office register API.",
+    description="B6 Asbestos Management — Register API.",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -112,7 +114,8 @@ app.add_middleware(
 app.add_middleware(TokenIntrospectionMiddleware)
 
 
-# ---- Exception handlers (routers stay thin) ----
+# ---- Exception handlers ----
+
 @app.exception_handler(DomainError)
 async def _domain_error_handler(_request: Request, exc: DomainError) -> JSONResponse:
     return JSONResponse(
@@ -130,7 +133,6 @@ async def _validation_error_handler(
         for e in errors:
             entry = {k: v for k, v in e.items() if k not in ("ctx", "url")}
             if "ctx" in e:
-                # ctx values may contain exception objects — coerce to str
                 entry["ctx"] = {
                     k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
                     for k, v in e["ctx"].items()
@@ -146,8 +148,6 @@ async def _validation_error_handler(
 
 @app.exception_handler(Exception)
 async def _unhandled_error_handler(_request: Request, exc: Exception) -> JSONResponse:
-    # Any error not modelled as a DomainError still gets the standard envelope —
-    # and the internal detail is logged, never leaked to the client.
     logger.exception("Unhandled error: %s", exc)
     return JSONResponse(
         status_code=500,
@@ -160,23 +160,49 @@ async def _unhandled_error_handler(_request: Request, exc: Exception) -> JSONRes
 # /register/bulk-upload/* paths and must be registered BEFORE register_router's
 # dynamic /register/{asbestos_site_id} route.
 _PREFIX = settings.api_base_prefix
-app.include_router(configuration_router, prefix=_PREFIX)
-app.include_router(audit_router, prefix=_PREFIX)
-app.include_router(files_router, prefix=_PREFIX)
-app.include_router(lookup_router, prefix=_PREFIX)
-app.include_router(bulk_router, prefix=_PREFIX)
-app.include_router(documents_router, prefix=_PREFIX)
-app.include_router(acm_entries_router, prefix=_PREFIX)
-app.include_router(qrcode_router, prefix=_PREFIX)
-app.include_router(register_router, prefix=_PREFIX)
+
+app.include_router(configuration_router, prefix=_PREFIX, include_in_schema=False)
+app.include_router(audit_router, prefix=_PREFIX, include_in_schema=False)
+app.include_router(files_router, prefix=_PREFIX, include_in_schema=False)
+app.include_router(lookup_router, prefix=_PREFIX, include_in_schema=False)
+app.include_router(bulk_router, prefix=_PREFIX, include_in_schema=False)
+app.include_router(documents_router, prefix=_PREFIX, include_in_schema=False)
+app.include_router(acm_entries_router, prefix=_PREFIX, include_in_schema=False)
+app.include_router(qrcode_router, prefix=_PREFIX, include_in_schema=False)
+app.include_router(register_router, prefix=_PREFIX, include_in_schema=False)
+app.include_router(mobile_router, prefix=_PREFIX)
 
 # Unauthenticated public QR view at the application root.
-app.include_router(public_router)
+app.include_router(public_router, include_in_schema=False)
 
 
-@app.get("/health", tags=["health"])
+@app.get("/health", tags=["health"], include_in_schema=False)
 async def health() -> dict:
     return {"status": "healthy"}
+
+
+# ---- Swagger customisation ----
+# Only mobile routes are visible in Swagger. We strip FastAPI's auto-generated
+# auth header params and replace them with clean explicit fields.
+
+_STRIP_PARAMS = {"authorization", "x-tenant-id", "x-user-id"}
+
+_SWAGGER_AUTH_HEADERS = [
+    {
+        "in": "header",
+        "name": "X-Api-Token",
+        "required": True,
+        "schema": {"type": "string"},
+        "description": "Paste your access token here.",
+    },
+    {
+        "in": "header",
+        "name": "X-Tenant-Id",
+        "required": True,
+        "schema": {"type": "string", "format": "uuid"},
+        "description": "Your tenant UUID.",
+    },
+]
 
 
 def _custom_openapi() -> dict:
@@ -188,27 +214,18 @@ def _custom_openapi() -> dict:
         description=app.description,
         routes=app.routes,
     )
-    # Add Bearer + X-Tenant-Id security scheme so Swagger shows the Authorize button.
-    schema.setdefault("components", {})
-    schema["components"]["securitySchemes"] = {
-        "BearerAuth": {
-            "type": "http",
-            "scheme": "bearer",
-            "bearerFormat": "JWT",
-            "description": "Paste your access token. Swagger adds 'Bearer ' automatically.",
-        },
-        "TenantId": {
-            "type": "apiKey",
-            "in": "header",
-            "name": "X-Tenant-Id",
-            "description": "Your tenant UUID.",
-        },
-    }
-    # Apply both schemes globally to every operation.
     for path_item in schema.get("paths", {}).values():
         for operation in path_item.values():
-            if isinstance(operation, dict):
-                operation["security"] = [{"BearerAuth": [], "TenantId": []}]
+            if not isinstance(operation, dict):
+                continue
+            operation["parameters"] = [
+                p for p in operation.get("parameters", [])
+                if p.get("name", "").lower() not in _STRIP_PARAMS
+            ]
+            existing = {p["name"] for p in operation["parameters"]}
+            for header in _SWAGGER_AUTH_HEADERS:
+                if header["name"] not in existing:
+                    operation["parameters"].append(header)
     app.openapi_schema = schema
     return schema
 

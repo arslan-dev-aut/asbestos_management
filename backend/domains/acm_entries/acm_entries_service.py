@@ -745,6 +745,69 @@ async def check_asset_acm_link(
     )
 
 
+async def list_acm_entries_by_asset(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    asset_id: str,
+    status_filter: str = "active",
+    page: int = 0,
+    page_size: int = 20,
+) -> ActiveAcmEntriesResponse:
+    """Return all ACM entries linked to a specific asset across all sites for the tenant."""
+    page = max(0, page)
+    page_size = max(1, min(page_size, 50))
+
+    base_where = [
+        AsbestosAcmEntries.tenant_id == uuid.UUID(tenant_id),
+        AsbestosAcmEntries.asset_id == uuid.UUID(asset_id),
+    ]
+    if status_filter.lower() == "active":
+        base_where.append(AsbestosAcmEntries.status == AcmStatus.ACTIVE.value)
+
+    total_count = await session.scalar(select(func.count()).where(*base_where))
+
+    entries = list(
+        (
+            await session.scalars(
+                select(AsbestosAcmEntries)
+                .where(*base_where)
+                .options(
+                    selectinload(AsbestosAcmEntries.building_type),
+                    selectinload(AsbestosAcmEntries.acm_type),
+                    selectinload(AsbestosAcmEntries.attachments),
+                )
+                .order_by(AsbestosAcmEntries.created_at)
+                .offset(page * page_size)
+                .limit(page_size)
+            )
+        ).all()
+    )
+
+    user_ids = {str(e.updated_by) for e in entries}
+    resolved = ResolvedNames()
+    resolved_assets: dict[str, str | None] = {}
+    resolved_users: dict[str, str | None] = {}
+    if entries:
+        async with MainSubSysClient(tenant_id) as mss:
+            resolved = await mss.resolve_all(asset_ids={asset_id}, user_ids=user_ids)
+            resolved_assets = {asset_id: resolved.asset(asset_id)}
+            resolved_users = {uid: resolved.user(uid) for uid in user_ids}
+
+    views = [
+        await _entry_to_active_view(
+            e, resolved_assets, resolved_users, _compute_discrepancy(e, resolved)
+        )
+        for e in entries
+    ]
+    return ActiveAcmEntriesResponse(
+        acmEntries=views,
+        totalCount=int(total_count or 0),
+        page=page,
+        pageSize=page_size,
+    )
+
+
 async def get_asset_acm_mapping(
     session: AsyncSession, *, tenant_id: str, site_id: str
 ) -> AssetAcmMappingResponse:

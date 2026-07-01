@@ -160,14 +160,9 @@ def _sub_cache_set(identity_user_id: str, user_id: str) -> None:
     if len(_sub_cache) > _SUB_CACHE_MAX:
         _sub_cache.popitem(last=False)
 
-_SKIP_PATHS: frozenset[str] = frozenset({
-    "/health",
-    "/docs",
-    "/redoc",
-    "/openapi.json",
-})
-
-_SKIP_PREFIXES: tuple[str, ...] = ("/public/",)
+# Only validate tokens on the mobile API surface. All other routes (web API,
+# public QR view, health, docs) pass through without any auth check.
+_VALIDATED_PREFIXES: tuple[str, ...] = ("/api/v1/asbestos/mobile/",)
 
 
 # ------------------------------------------------------------------ #
@@ -180,7 +175,8 @@ def _bearer_token(authorization: str | None) -> str | None:
     parts = authorization.split(" ", 1)
     if len(parts) == 2 and parts[0].lower() == "bearer":
         return parts[1].strip()
-    return None
+    # Accept a raw token (no "Bearer " prefix) — allows pasting directly in Swagger.
+    return authorization.strip() or None
 
 
 def _decode_claims_unverified(token: str) -> dict:
@@ -235,6 +231,10 @@ async def _call_userinfo(token: str, authority: str) -> dict:
                 f"UserInfo endpoint returned HTTP {resp.status}: {body[:300]}"
             )
 
+    except TimeoutError as exc:
+        raise PermissionError(
+            f"Identity provider timed out at {url}. Check VPN connectivity or set AUTH_DEV_FALLBACK=true for local development."
+        ) from exc
     except aiohttp.ClientConnectorError as exc:
         raise PermissionError(
             f"Cannot reach identity provider at {url}. "
@@ -314,12 +314,13 @@ class TokenIntrospectionMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
         path = request.url.path
 
-        # ── 1. Skip public / infra paths ─────────────────────────────────
-        if path in _SKIP_PATHS or any(path.startswith(p) for p in _SKIP_PREFIXES):
+        # ── 1. Only validate mobile routes — all others pass through ─────────
+        if not any(path.startswith(p) for p in _VALIDATED_PREFIXES):
             return await call_next(request)
 
         settings = get_settings()
-        authorization = request.headers.get("Authorization")
+        # Accept token from standard Authorization header OR X-Api-Token (used by Swagger UI).
+        authorization = request.headers.get("Authorization") or request.headers.get("X-Api-Token")
         x_tenant_id = request.headers.get("X-Tenant-Id")
         token = _bearer_token(authorization)
 

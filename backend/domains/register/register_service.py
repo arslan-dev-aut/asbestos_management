@@ -31,6 +31,7 @@ from backend.database.exceptions import DuplicateError, NotFoundError, Validatio
 from backend.domains.audit import audit_service
 from backend.domains.documents import documents_service
 from backend.domains.documents.documents_service import DocumentInput, _save_document
+from backend.domains.mobile.mobile_models import MobileSiteDetail, MobileSiteDetailResponse
 from backend.domains.register.register_models import (
     RegisterCustomerItem,
     RegisterSiteItem,
@@ -657,6 +658,41 @@ async def get_detail(
         updatedByName=resolved.user(str(site.updated_by)),
     )
     return SiteDetailResponse(site=detail)
+
+
+async def get_mobile_site_detail(
+    session: AsyncSession, *, tenant_id: str, site_id: str
+) -> MobileSiteDetailResponse:
+    """Slim site detail for the mobile surface: 5 fields only."""
+    site = await _load_site(session, site_id, tenant_id)
+
+    acm_agg = _acm_agg_subquery()
+    agg_row = (
+        await session.execute(
+            select(
+                func.coalesce(acm_agg.c.active_acm, 0),
+                func.coalesce(acm_agg.c.risk_rank, 0),
+            ).where(acm_agg.c.site_id == site.id)
+        )
+    ).one_or_none()
+    active_acm = int(agg_row[0]) if agg_row else 0
+    risk_rank = int(agg_row[1]) if agg_row else 0
+
+    async with MainSubSysClient(tenant_id) as mss:
+        resolved = await mss.resolve_all(
+            customer_ids={str(site.customer_id)},
+            site_ids={str(site.site_id)},
+        )
+
+    return MobileSiteDetailResponse(
+        site=MobileSiteDetail(
+            asbestosSiteId=str(site.id),
+            siteName=resolved.site(str(site.site_id)),
+            customerName=resolved.customer(str(site.customer_id)),
+            highestRisk=_RANK_TO_HIGHEST[risk_rank].value,
+            activeAcmEntriesCount=active_acm,
+        )
+    )
 
 
 async def get_asbestos_status(
