@@ -19,8 +19,12 @@ from backend.core.enums import AuditAction, AuditType, DocType
 from backend.database.db_models import AsbestosSiteDocuments, AsbestosSites
 from backend.database.exceptions import NotFoundError, ValidationError
 from backend.domains.audit import audit_service
-from backend.domains.documents.documents_models import DocumentMeta, SiteDocument
-from backend.integrations.mainsubsys import ResolvedNames
+from backend.domains.documents.documents_models import (
+    DocumentMeta,
+    SiteDocument,
+    SiteDocumentsPaginatedResponse,
+)
+from backend.integrations.mainsubsys import MainSubSysClient, ResolvedNames
 
 
 @dataclass
@@ -80,7 +84,7 @@ async def current_amp(session: AsyncSession, site_id: str) -> AsbestosSiteDocume
                 AsbestosSiteDocuments.is_current_amp.is_(True),
             )
         )
-    ).first()
+    ).one_or_none()
 
 
 async def _require_site(session: AsyncSession, site_id: str, tenant_id: str) -> AsbestosSites:
@@ -91,7 +95,7 @@ async def _require_site(session: AsyncSession, site_id: str, tenant_id: str) -> 
                 AsbestosSites.tenant_id == uuid.UUID(tenant_id),
             )
         )
-    ).first()
+    ).one_or_none()
     if site is None:
         raise NotFoundError("Site not found in register.")
     return site
@@ -273,8 +277,6 @@ async def upload_documents(
     documents: list[DocumentInput],
 ) -> list[SiteDocument]:
     """Upload multiple documents for an existing site in a single commit."""
-    from backend.integrations.mainsubsys import MainSubSysClient
-
     await _require_site(session, site_id, tenant_id)
     uploaded_keys: list[str] = []
     docs: list[AsbestosSiteDocuments] = []
@@ -342,7 +344,6 @@ async def upload_document(
         raise
     await session.refresh(doc)
 
-    from backend.integrations.mainsubsys import MainSubSysClient
 
     async with MainSubSysClient(tenant_id) as mss:
         resolved = await mss.resolve_all(user_ids={str(doc.uploaded_by)})
@@ -362,6 +363,7 @@ async def update_amp_expiry(
     doc = await session.get(AsbestosSiteDocuments, uuid.UUID(document_id))
     if (
         doc is None
+        or doc.tenant_id != uuid.UUID(tenant_id)
         or str(doc.asbestos_site_id) != site_id
         or doc.doc_type != DocType.AMP.value
     ):
@@ -389,7 +391,6 @@ async def update_amp_expiry(
     await session.commit()
     await session.refresh(doc)
 
-    from backend.integrations.mainsubsys import MainSubSysClient
 
     async with MainSubSysClient(tenant_id) as mss:
         resolved = await mss.resolve_all(user_ids={str(doc.uploaded_by)})
@@ -445,7 +446,7 @@ async def remove_document(
     session: AsyncSession, *, tenant_id: str, site_id: str, document_id: str, user_id: str
 ) -> None:
     doc = await session.get(AsbestosSiteDocuments, uuid.UUID(document_id))
-    if doc is None or str(doc.asbestos_site_id) != site_id or str(doc.tenant_id) != tenant_id:
+    if doc is None or str(doc.asbestos_site_id) != site_id or doc.tenant_id != uuid.UUID(tenant_id):
         raise NotFoundError("Document not found.")
 
     blob_key = doc.file_url
@@ -475,7 +476,7 @@ async def remove_document(
 
 async def download_url(session: AsyncSession, *, tenant_id: str, site_id: str, document_id: str) -> str:
     doc = await session.get(AsbestosSiteDocuments, uuid.UUID(document_id))
-    if doc is None or str(doc.asbestos_site_id) != site_id or str(doc.tenant_id) != tenant_id:
+    if doc is None or str(doc.asbestos_site_id) != site_id or doc.tenant_id != uuid.UUID(tenant_id):
         raise NotFoundError("Document not found.")
     return await storage.presigned_url(doc.file_url)
 
@@ -487,11 +488,8 @@ async def list_documents_paginated(
     site_id: str,
     page: int = 0,
     page_size: int = 20,
-) -> "SiteDocumentsPaginatedResponse":
+) -> SiteDocumentsPaginatedResponse:
     """Return all documents for a site (all types), paginated, with presigned download URLs."""
-    from backend.integrations.mainsubsys import MainSubSysClient
-    from backend.domains.documents.documents_models import SiteDocumentsPaginatedResponse
-
     await _require_site(session, site_id, tenant_id)
 
     page = max(0, page)

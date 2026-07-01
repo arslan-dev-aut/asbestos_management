@@ -1,4 +1,10 @@
-"""Configuration endpoints (Section 4.1) — Building Types & ACM Types."""
+"""Configuration endpoints (Section 4.1) — Building Types & ACM Types.
+
+Route handlers stay thin: expected failures are raised as ``DomainError``
+subclasses by the service layer and unexpected ones by anything below; both are
+turned into the standard JSON envelope by the app-level exception handlers in
+``backend.main``. Handlers therefore contain no try/except of their own.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +12,6 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.validation import validate_nonempty, validate_uuid
-from backend.database.exceptions import DomainError, UpstreamError
 from backend.database.postgres import get_session
 from backend.domains.configuration import configuration_service as svc
 from backend.domains.configuration.configuration_models import (
@@ -32,20 +37,15 @@ async def list_building_types(
     ctx: AuthContext = Depends(get_context),
     session: AsyncSession = Depends(get_session),
 ) -> BuildingTypesListResponse:
-    try:
-        items, total = await svc.list_types(
-            session, svc.BUILDING,
-            tenant_id=ctx.tenant_id,
-            active_only=activeOnly,
-            search=search,
-            page_index=pageIndex,
-            page_size=pageSize,
-        )
-        return BuildingTypesListResponse(buildingTypes=items, totalCount=total)
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to retrieve building types.", detail=str(exc)) from exc
+    items, total = await svc.list_types(
+        session, svc.BUILDING,
+        tenant_id=ctx.tenant_id,
+        active_only=activeOnly,
+        search=search,
+        page_index=pageIndex,
+        page_size=pageSize,
+    )
+    return BuildingTypesListResponse(buildingTypes=items, totalCount=total)
 
 
 @router.post("/building-types", response_model=BuildingTypeResponse, status_code=201)
@@ -55,15 +55,10 @@ async def add_building_type(
     session: AsyncSession = Depends(get_session),
 ) -> BuildingTypeResponse:
     validate_nonempty(body.name, "name")
-    try:
-        item = await svc.create_type(
-            session, svc.BUILDING, name=body.name, tenant_id=ctx.tenant_id, user_id=ctx.user_id
-        )
-        return BuildingTypeResponse(buildingType=item, message="Building type added.")
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to create building type.", detail=str(exc)) from exc
+    item = await svc.create_type(
+        session, svc.BUILDING, name=body.name, tenant_id=ctx.tenant_id, user_id=ctx.user_id
+    )
+    return BuildingTypeResponse(buildingType=item, message="Building type added.")
 
 
 @router.patch("/building-types/{type_id}", response_model=BuildingTypeResponse)
@@ -74,19 +69,14 @@ async def toggle_building_type(
     session: AsyncSession = Depends(get_session),
 ) -> BuildingTypeResponse:
     validate_uuid(type_id, "typeId")
-    try:
-        item = await svc.toggle_type(
-            session, svc.BUILDING,
-            type_id=type_id,
-            tenant_id=ctx.tenant_id,
-            is_active=body.isActive,
-            user_id=ctx.user_id,
-        )
-        return BuildingTypeResponse(buildingType=item)
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to update building type.", detail=str(exc)) from exc
+    item = await svc.toggle_type(
+        session, svc.BUILDING,
+        type_id=type_id,
+        tenant_id=ctx.tenant_id,
+        is_active=body.isActive,
+        user_id=ctx.user_id,
+    )
+    return BuildingTypeResponse(buildingType=item)
 
 
 # ---- ACM Types ----
@@ -99,20 +89,15 @@ async def list_acm_types(
     ctx: AuthContext = Depends(get_context),
     session: AsyncSession = Depends(get_session),
 ) -> AcmTypesListResponse:
-    try:
-        items, total = await svc.list_types(
-            session, svc.ACM,
-            tenant_id=ctx.tenant_id,
-            active_only=activeOnly,
-            search=search,
-            page_index=pageIndex,
-            page_size=pageSize,
-        )
-        return AcmTypesListResponse(acmTypes=items, totalCount=total)
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to retrieve ACM types.", detail=str(exc)) from exc
+    items, total = await svc.list_types(
+        session, svc.ACM,
+        tenant_id=ctx.tenant_id,
+        active_only=activeOnly,
+        search=search,
+        page_index=pageIndex,
+        page_size=pageSize,
+    )
+    return AcmTypesListResponse(acmTypes=items, totalCount=total)
 
 
 @router.post("/acm-types", response_model=AcmTypeResponse, status_code=201)
@@ -122,15 +107,10 @@ async def add_acm_type(
     session: AsyncSession = Depends(get_session),
 ) -> AcmTypeResponse:
     validate_nonempty(body.name, "name")
-    try:
-        item = await svc.create_type(
-            session, svc.ACM, name=body.name, tenant_id=ctx.tenant_id, user_id=ctx.user_id
-        )
-        return AcmTypeResponse(acmType=item, message="ACM type added.")
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to create ACM type.", detail=str(exc)) from exc
+    item = await svc.create_type(
+        session, svc.ACM, name=body.name, tenant_id=ctx.tenant_id, user_id=ctx.user_id
+    )
+    return AcmTypeResponse(acmType=item, message="ACM type added.")
 
 
 @router.patch("/acm-types/{type_id}", response_model=AcmTypeResponse)
@@ -141,16 +121,11 @@ async def toggle_acm_type(
     session: AsyncSession = Depends(get_session),
 ) -> AcmTypeResponse:
     validate_uuid(type_id, "typeId")
-    try:
-        item = await svc.toggle_type(
-            session, svc.ACM,
-            type_id=type_id,
-            tenant_id=ctx.tenant_id,
-            is_active=body.isActive,
-            user_id=ctx.user_id,
-        )
-        return AcmTypeResponse(acmType=item)
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to update ACM type.", detail=str(exc)) from exc
+    item = await svc.toggle_type(
+        session, svc.ACM,
+        type_id=type_id,
+        tenant_id=ctx.tenant_id,
+        is_active=body.isActive,
+        user_id=ctx.user_id,
+    )
+    return AcmTypeResponse(acmType=item)

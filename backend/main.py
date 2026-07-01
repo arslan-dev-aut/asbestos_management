@@ -7,6 +7,8 @@ consistent ``{success, message, detail}`` JSON envelope.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -14,12 +16,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from backend.config import get_settings
 from backend.core.storage import close_storage
 from backend.database.exceptions import DomainError
 from backend.database.postgres import dispose_engine, get_engine
 from backend.middleware.auth_introspect import TokenIntrospectionMiddleware, close_http_session
+
+logger = logging.getLogger("asbestos")
 from backend.domains.acm_entries.acm_entries_router import router as acm_entries_router
 from backend.domains.audit.audit_router import router as audit_router
 from backend.domains.bulk.bulk_router import router as bulk_router
@@ -31,14 +36,39 @@ from backend.domains.qrcode.qrcode_router import public_router
 from backend.domains.qrcode.qrcode_router import router as qrcode_router
 from backend.domains.register.register_router import router as register_router
 
+def _load_app_config_eagerly() -> None:
+    """Load Automation/<name>/* from Azure App Config into the environment BEFORE
+    the app/CORS/title are built, so every setting (including CORS origins) sees
+    the production values — not just lazily-read ones.
+
+    Runs at import time when no event loop is active (the normal uvicorn case).
+    If a loop is already running (e.g. under tests), this is skipped and the
+    lifespan hook performs the load instead.
+    """
+    cfg = get_settings()
+    if not cfg.app_configuration_connection_string:
+        return
+    try:
+        asyncio.get_running_loop()
+        return  # inside a running loop — defer to lifespan
+    except RuntimeError:
+        pass
+    try:
+        from joblogic_sdk.app_config import AppConfigManager
+
+        asyncio.run(AppConfigManager.load())
+        get_settings.cache_clear()
+    except Exception as exc:  # noqa: BLE001 - surface but don't crash boot
+        logger.warning("Eager App Config load failed: %s", exc)
+
+
+_load_app_config_eagerly()
 settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Production credential loading (repo convention): pull Automation/<name>/*
-    # from Azure App Configuration into the environment before any secret is
-    # read, then refresh the cached Settings so lazy consumers see the values.
+    # Fallback load for the in-event-loop case (eager import-time load skipped).
     cfg = get_settings()
     if cfg.app_configuration_connection_string:
         try:
@@ -47,19 +77,16 @@ async def lifespan(_app: FastAPI):
             await AppConfigManager.load()
             get_settings.cache_clear()
         except Exception as exc:  # noqa: BLE001 - surface but don't crash boot
-            import logging
-
-            logging.getLogger("asbestos").warning("App Config load failed: %s", exc)
+            logger.warning("App Config load failed: %s", exc)
 
     # Pre-warm the DB connection pool so the first user request doesn't pay the
     # cold-start cost (AAD token fetch + TCP+TLS to Azure PostgreSQL, ~4-5 s).
     try:
         engine = get_engine()
         async with engine.connect() as conn:
-            await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
+            await conn.execute(text("SELECT 1"))
     except Exception as exc:  # noqa: BLE001
-        import logging
-        logging.getLogger("asbestos").warning("DB pool pre-warm failed: %s", exc)
+        logger.warning("DB pool pre-warm failed: %s", exc)
 
     yield
     await dispose_engine()
@@ -114,6 +141,17 @@ async def _validation_error_handler(
     return JSONResponse(
         status_code=422,
         content={"success": False, "message": "Validation error.", "detail": _safe(exc.errors())},
+    )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+    # Any error not modelled as a DomainError still gets the standard envelope —
+    # and the internal detail is logged, never leaked to the client.
+    logger.exception("Unhandled error: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"success": False, "message": "An unexpected error occurred.", "detail": None},
     )
 
 

@@ -144,7 +144,7 @@ async def toggle_type(
                 kind.model.tenant_id == uuid.UUID(tenant_id),
             )
         )
-    ).first()
+    ).one_or_none()
     if row is None:
         raise NotFoundError("Type not found.")
 
@@ -160,4 +160,7 @@ async def toggle_type(
         details={"name": row.name, "typeId": str(row.id), "isActive": is_active},
     )
     await session.commit()
+    # updated_at is recomputed by onupdate=func.now() and left expired; refresh it
+    # inside the async context before serializing (avoids lazy IO post-commit).
+    await session.refresh(row)
     return _to_schema(row)

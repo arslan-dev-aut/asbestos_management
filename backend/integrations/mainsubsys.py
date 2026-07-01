@@ -26,10 +26,11 @@ from backend.database.exceptions import UpstreamError
 class ResolvedNames:
     """Bag of id → name maps resolved for one response build."""
 
-    customers: dict[str, str] = field(default_factory=dict)
-    sites:     dict[str, str] = field(default_factory=dict)
-    assets:    dict[str, str] = field(default_factory=dict)
-    users:     dict[str, str] = field(default_factory=dict)
+    customers:       dict[str, str] = field(default_factory=dict)
+    sites:           dict[str, str] = field(default_factory=dict)
+    assets:          dict[str, str] = field(default_factory=dict)
+    users:           dict[str, str] = field(default_factory=dict)
+    suspended_assets: set[str]      = field(default_factory=set)
 
     def customer(self, cid: str | None) -> str | None:
         return self.customers.get(str(cid)) if cid else None
@@ -43,6 +44,9 @@ class ResolvedNames:
     def user(self, uid: str | None) -> str | None:
         return self.users.get(str(uid)) if uid else None
 
+    def is_asset_suspended(self, aid: str | None) -> bool:
+        return str(aid) in self.suspended_assets if aid else False
+
 
 class MainSubSysClient:
     """Async context-manager client.  Usage::
@@ -51,14 +55,35 @@ class MainSubSysClient:
             names = await mss.resolve_users(user_ids)
     """
 
+    # Bound concurrent upstream calls so a large register page can't fire
+    # hundreds of simultaneous requests at MainSubSys.
+    _MAX_CONCURRENCY = 10
+
     def __init__(self, tenant_id: str) -> None:
         self._tenant_id = tenant_id
+        self._cm: JicroClient | None = None
+        self._client = None
+        self._sem = asyncio.Semaphore(self._MAX_CONCURRENCY)
 
     async def __aenter__(self) -> MainSubSysClient:
+        # One JicroClient (one TCP+TLS+auth handshake) reused for every lookup
+        # in this context, instead of a fresh client per GUID.
+        self._cm = JicroClient()
+        self._client = await self._cm.__aenter__()
         return self
 
-    async def __aexit__(self, *_exc) -> None:
-        pass
+    async def __aexit__(self, *exc) -> None:
+        if self._cm is not None:
+            await self._cm.__aexit__(*exc)
+            self._cm = None
+            self._client = None
+
+    async def _execute(self, **kwargs):
+        """Run one exec-jicro call on the shared client under the semaphore."""
+        if self._client is None:
+            raise RuntimeError("MainSubSysClient must be used as an async context manager.")
+        async with self._sem:
+            return await self._client.execute(**kwargs)
 
     # ------------------------------------------------------------------ #
     # Single-entity fetchers (GUID → name)
@@ -66,13 +91,12 @@ class MainSubSysClient:
 
     async def _fetch_customer_name(self, customer_id: str) -> tuple[str, str | None]:
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="GetCustomerMsg",
-                    payload={"UniqueId": customer_id},
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="GetCustomerMsg",
+                payload={"UniqueId": customer_id},
+            )
             obj = (result or {}).get("jicroResponse") or {}
             name = obj.get("Name") or obj.get("name")
             return customer_id, str(name) if name else None
@@ -81,43 +105,46 @@ class MainSubSysClient:
 
     async def _fetch_site_name(self, site_id: str) -> tuple[str, str | None]:
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="GetSiteMsg",
-                    payload={"UniqueId": site_id},
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="GetSiteMsg",
+                payload={"UniqueId": site_id},
+            )
             obj = (result or {}).get("jicroResponse") or {}
             name = obj.get("Name") or obj.get("name")
             return site_id, str(name) if name else None
         except JicroError:
             return site_id, None
 
-    async def _fetch_asset_name(self, asset_id: str) -> tuple[str, str | None]:
+    async def _fetch_asset_name(self, asset_id: str) -> tuple[str, str | None, bool]:
+        """Returns (asset_id, name_or_None, is_suspended).
+
+        name_or_None is None when the asset does not exist (removed).
+        is_suspended reflects IsSuspended from Joblogic.
+        """
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="GetAssetByUniqueIdMsg",
-                    payload={"UniqueId": asset_id},
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="GetAssetByUniqueIdMsg",
+                payload={"UniqueId": asset_id},
+            )
             obj = (result or {}).get("jicroResponse") or {}
             name = obj.get("Description") or obj.get("description")
-            return asset_id, str(name) if name else None
+            is_suspended = bool(obj.get("IsSuspended") or obj.get("isSuspended"))
+            return asset_id, str(name) if name else None, is_suspended
         except JicroError:
-            return asset_id, None
+            return asset_id, None, False
 
     async def _fetch_user_name(self, user_id: str) -> tuple[str, str | None]:
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="role",
-                    message_signature="GetUserByGuidMsg",
-                    payload={"Guid": user_id},
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="role",
+                message_signature="GetUserByGuidMsg",
+                payload={"Guid": user_id},
+            )
             user = (result or {}).get("jicroResponse") or {}
             name = user.get("name")
             return user_id, str(name) if name else None
@@ -142,12 +169,19 @@ class MainSubSysClient:
         pairs = await asyncio.gather(*(self._fetch_site_name(sid) for sid in ids))
         return {sid: name for sid, name in pairs if name is not None}
 
-    async def resolve_assets(self, ids: set[str]) -> dict[str, str]:
+    async def resolve_assets(self, ids: set[str]) -> tuple[dict[str, str], set[str]]:
+        """Returns (name_map, suspended_ids).
+
+        name_map: asset_id → description (only for assets that exist).
+        suspended_ids: asset_ids where IsSuspended is True.
+        """
         ids = {str(i) for i in ids if i}
         if not ids:
-            return {}
-        pairs = await asyncio.gather(*(self._fetch_asset_name(aid) for aid in ids))
-        return {aid: name for aid, name in pairs if name is not None}
+            return {}, set()
+        triples = await asyncio.gather(*(self._fetch_asset_name(aid) for aid in ids))
+        name_map = {aid: name for aid, name, _ in triples if name is not None}
+        suspended = {aid for aid, _, suspended in triples if suspended}
+        return name_map, suspended
 
     async def resolve_users(self, ids: set[str]) -> dict[str, str]:
         """Resolve a set of user GUIDs to display names in parallel."""
@@ -159,7 +193,7 @@ class MainSubSysClient:
 
     async def validate_assets(self, ids: set[str]) -> set[str]:
         """Return the subset of asset IDs that still exist in MainSubSys."""
-        found = await self.resolve_assets(ids)
+        found, _ = await self.resolve_assets(ids)
         return set(found.keys())
 
     async def resolve_all(
@@ -171,13 +205,19 @@ class MainSubSysClient:
         user_ids:     set[str] | None = None,
     ) -> ResolvedNames:
         """Resolve every needed name map concurrently."""
-        customers, sites, assets, users = await asyncio.gather(
+        customers, sites, (assets, suspended), users = await asyncio.gather(
             self.resolve_customers(customer_ids or set()),
             self.resolve_sites    (site_ids     or set()),
             self.resolve_assets   (asset_ids    or set()),
             self.resolve_users    (user_ids     or set()),
         )
-        return ResolvedNames(customers=customers, sites=sites, assets=assets, users=users)
+        return ResolvedNames(
+            customers=customers,
+            sites=sites,
+            assets=assets,
+            users=users,
+            suspended_assets=suspended,
+        )
 
     # ------------------------------------------------------------------ #
     # Search helpers (text → list of UniqueId GUIDs)
@@ -186,18 +226,17 @@ class MainSubSysClient:
     async def search_customer_ids(self, text: str) -> list[str]:
         """Return customer UniqueId GUIDs whose name contains *text*."""
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="GetFilteredCustomerMsg",
-                    payload={
-                        "SearchTerm": text,
-                        "IncludeInactive": False,
-                        "PageIndex": 1,
-                        "PageSize": 200,
-                    },
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="GetFilteredCustomerMsg",
+                payload={
+                    "SearchTerm": text,
+                    "IncludeInactive": False,
+                    "PageIndex": 1,
+                    "PageSize": 200,
+                },
+            )
         except JicroError as exc:
             raise UpstreamError("MainSubSys is unavailable.", detail=str(exc)) from exc
         jicro = (result or {}).get("jicroResponse") or {}
@@ -207,18 +246,17 @@ class MainSubSysClient:
     async def search_site_ids(self, text: str) -> list[str]:
         """Return site UniqueId GUIDs whose name contains *text*."""
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="SearchSiteMsg",
-                    payload={
-                        "SearchTerm": text,
-                        "PageSize": 200,
-                        "PageIndex": 1,
-                        "SelectedTab": 3,
-                    },
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="SearchSiteMsg",
+                payload={
+                    "SearchTerm": text,
+                    "PageSize": 200,
+                    "PageIndex": 1,
+                    "SelectedTab": 3,
+                },
+            )
         except JicroError as exc:
             raise UpstreamError("MainSubSys is unavailable.", detail=str(exc)) from exc
         jicro = (result or {}).get("jicroResponse") or {}
@@ -232,18 +270,17 @@ class MainSubSysClient:
     async def find_customer_by_name(self, name: str) -> str | None:
         """Return the UniqueId GUID of the customer with exactly this name."""
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="GetFilteredCustomerMsg",
-                    payload={
-                        "SearchTerm": name.strip(),
-                        "IncludeInactive": False,
-                        "PageIndex": 1,
-                        "PageSize": 50,
-                    },
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="GetFilteredCustomerMsg",
+                payload={
+                    "SearchTerm": name.strip(),
+                    "IncludeInactive": False,
+                    "PageIndex": 1,
+                    "PageSize": 50,
+                },
+            )
         except JicroError as exc:
             raise UpstreamError("MainSubSys is unavailable.", detail=str(exc)) from exc
         jicro = (result or {}).get("jicroResponse") or {}
@@ -256,18 +293,17 @@ class MainSubSysClient:
     async def find_site_by_name(self, name: str) -> str | None:
         """Return the UniqueId GUID of the site with exactly this name."""
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="SearchSiteMsg",
-                    payload={
-                        "SearchTerm": name.strip(),
-                        "PageSize": 50,
-                        "PageIndex": 1,
-                        "SelectedTab": 3,
-                    },
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="SearchSiteMsg",
+                payload={
+                    "SearchTerm": name.strip(),
+                    "PageSize": 50,
+                    "PageIndex": 1,
+                    "SelectedTab": 3,
+                },
+            )
         except JicroError as exc:
             raise UpstreamError("MainSubSys is unavailable.", detail=str(exc)) from exc
         jicro = (result or {}).get("jicroResponse") or {}
@@ -280,20 +316,19 @@ class MainSubSysClient:
     async def find_asset_by_name(self, name: str) -> str | None:
         """Return the UniqueId GUID of the asset with exactly this description."""
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="GetFilteredAssetMsg",
-                    payload={
-                        "SearchTerm": name.strip(),
-                        "SearchCondition": 0,
-                        "IncludeInactive": False,
-                        "OrderBy": 0,
-                        "PageIndex": 1,
-                        "PageSize": 50,
-                    },
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="GetFilteredAssetMsg",
+                payload={
+                    "SearchTerm": name.strip(),
+                    "SearchCondition": 0,
+                    "IncludeInactive": False,
+                    "OrderBy": 0,
+                    "PageIndex": 1,
+                    "PageSize": 50,
+                },
+            )
         except JicroError as exc:
             raise UpstreamError("MainSubSys is unavailable.", detail=str(exc)) from exc
         jicro = (result or {}).get("jicroResponse") or {}
@@ -318,20 +353,22 @@ class MainSubSysClient:
         from backend.database.exceptions import NotFoundError
 
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="GetCustomerMsg",
-                    payload={"UniqueId": unique_id},
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="GetCustomerMsg",
+                payload={"UniqueId": unique_id},
+            )
         except JicroError as exc:
             raise UpstreamError("MainSubSys is unavailable.", detail=str(exc)) from exc
         obj = (result or {}).get("jicroResponse") or {}
         auto_id = obj.get("Id") or obj.get("id")
         if not auto_id:
             raise NotFoundError(f"Customer '{unique_id}' not found.")
-        return int(auto_id)
+        try:
+            return int(auto_id)
+        except (TypeError, ValueError) as exc:
+            raise UpstreamError("MainSubSys returned a malformed customer id.", detail=str(auto_id)) from exc
 
     async def get_site_auto_id(self, unique_id: str) -> int:
         """Resolve a site UniqueId (GUID) to its integer auto-ID.
@@ -341,20 +378,22 @@ class MainSubSysClient:
         from backend.database.exceptions import NotFoundError
 
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="GetSiteMsg",
-                    payload={"UniqueId": unique_id},
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="GetSiteMsg",
+                payload={"UniqueId": unique_id},
+            )
         except JicroError as exc:
             raise UpstreamError("MainSubSys is unavailable.", detail=str(exc)) from exc
         obj = (result or {}).get("jicroResponse") or {}
         auto_id = obj.get("Id") or obj.get("id")
         if not auto_id:
             raise NotFoundError(f"Site '{unique_id}' not found.")
-        return int(auto_id)
+        try:
+            return int(auto_id)
+        except (TypeError, ValueError) as exc:
+            raise UpstreamError("MainSubSys returned a malformed site id.", detail=str(auto_id)) from exc
 
     # ------------------------------------------------------------------ #
     # Customer / site listing (for lookup dropdowns)
@@ -365,18 +404,17 @@ class MainSubSysClient:
     ) -> list[dict]:
         """List customers via GetFilteredCustomerMsg."""
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="GetFilteredCustomerMsg",
-                    payload={
-                        "SearchTerm": search or "",
-                        "IncludeInactive": False,
-                        "PageIndex": 1,
-                        "PageSize": page_size,
-                    },
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="GetFilteredCustomerMsg",
+                payload={
+                    "SearchTerm": search or "",
+                    "IncludeInactive": False,
+                    "PageIndex": 1,
+                    "PageSize": page_size,
+                },
+            )
         except JicroError as exc:
             raise UpstreamError("MainSubSys is unavailable.", detail=str(exc)) from exc
         jicro = (result or {}).get("jicroResponse") or {}
@@ -391,19 +429,18 @@ class MainSubSysClient:
         """
         customer_auto_id = await self.get_customer_auto_id(customer_unique_id)
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="SearchSiteMsg",
-                    payload={
-                        "SearchTerm": search or "",
-                        "CustomerId": customer_auto_id,
-                        "PageSize": page_size,
-                        "PageIndex": 1,
-                        "SelectedTab": 3,
-                    },
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="SearchSiteMsg",
+                payload={
+                    "SearchTerm": search or "",
+                    "CustomerId": customer_auto_id,
+                    "PageSize": page_size,
+                    "PageIndex": 1,
+                    "SelectedTab": 3,
+                },
+            )
         except JicroError as exc:
             raise UpstreamError("MainSubSys is unavailable.", detail=str(exc)) from exc
         jicro = (result or {}).get("jicroResponse") or {}
@@ -418,21 +455,20 @@ class MainSubSysClient:
         """
         site_auto_id = await self.get_site_auto_id(site_unique_id)
         try:
-            async with JicroClient() as client:
-                result = await client.execute(
-                    tenant_id=self._tenant_id,
-                    service_name="core",
-                    message_signature="GetFilteredAssetMsg",
-                    payload={
-                        "SiteId": site_auto_id,
-                        "SearchTerm": search or "",
-                        "SearchCondition": 0,
-                        "IncludeInactive": False,
-                        "OrderBy": 0,
-                        "PageIndex": 1,
-                        "PageSize": page_size,
-                    },
-                )
+            result = await self._execute(
+                tenant_id=self._tenant_id,
+                service_name="core",
+                message_signature="GetFilteredAssetMsg",
+                payload={
+                    "SiteId": site_auto_id,
+                    "SearchTerm": search or "",
+                    "SearchCondition": 0,
+                    "IncludeInactive": False,
+                    "OrderBy": 0,
+                    "PageIndex": 1,
+                    "PageSize": page_size,
+                },
+            )
         except JicroError as exc:
             raise UpstreamError("MainSubSys is unavailable.", detail=str(exc)) from exc
         jicro = (result or {}).get("jicroResponse") or {}

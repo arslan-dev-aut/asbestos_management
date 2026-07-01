@@ -6,10 +6,16 @@ Pure functions, no I/O, so they are trivially unit-testable.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import date
+from datetime import date, datetime, timezone
 
 from backend.config import get_settings
 from backend.core.enums import RISK_ORDER, RISK_TO_RAG, HighestRisk, Rag
+
+
+def _utc_today() -> date:
+    """Today's date in UTC — stored timestamps are timezone-aware, so the
+    compliance RAG must not flip a day early/late on a non-UTC host."""
+    return datetime.now(timezone.utc).date()
 
 _RANK_TO_HIGHEST = {
     0: HighestRisk.NONE,
@@ -38,7 +44,7 @@ def amp_expiry_rag(expiry: date | None, *, today: date | None = None) -> Rag:
     """
     if expiry is None:
         return Rag.NONE
-    today = today or date.today()
+    today = today or _utc_today()
     threshold = get_settings().amp_expiry_warning_days
     days_left = (expiry - today).days
     if days_left < 0:
@@ -51,13 +57,13 @@ def amp_expiry_rag(expiry: date | None, *, today: date | None = None) -> Rag:
 def is_amp_expired(expiry: date | None, *, today: date | None = None) -> bool:
     if expiry is None:
         return False
-    today = today or date.today()
+    today = today or _utc_today()
     return (expiry - today).days < 0
 
 
 def is_amp_expiring_soon(expiry: date | None, *, today: date | None = None) -> bool:
     if expiry is None:
         return False
-    today = today or date.today()
+    today = today or _utc_today()
     days_left = (expiry - today).days
     return 0 <= days_left <= get_settings().amp_expiry_warning_days

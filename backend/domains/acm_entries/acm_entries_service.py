@@ -8,8 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from sqlalchemy import func
+
 from backend.core import rag, storage
-from backend.core.enums import AuditAction, AuditType
+from backend.core.enums import AcmStatus, AuditAction, AuditType
 from backend.database.db_models import (
     AsbestosAcmAttachments,
     AsbestosAcmEntries,
@@ -21,11 +23,17 @@ from backend.database.exceptions import NotFoundError, ValidationError
 from backend.domains.acm_entries.acm_entries_models import (
     AcmAttachment,
     AcmEntry,
+    ActiveAcmAttachmentView,
+    ActiveAcmEntriesResponse,
+    ActiveAcmEntryView,
+    AssetAcmItem,
+    AssetAcmLinkResponse,
+    AssetAcmMappingResponse,
     CreateAcmRequest,
     UpdateAcmRequest,
 )
 from backend.domains.audit import audit_service
-from backend.integrations.mainsubsys import ResolvedNames
+from backend.integrations.mainsubsys import MainSubSysClient, ResolvedNames
 
 
 # ---- serialization ----
@@ -86,7 +94,7 @@ async def _load_entry(
                 selectinload(AsbestosAcmEntries.attachments),
             )
         )
-    ).first()
+    ).one_or_none()
     if entry is None:
         raise NotFoundError("ACM entry not found.")
     return entry
@@ -100,7 +108,7 @@ async def _require_site(session: AsyncSession, site_id: str, tenant_id: str) -> 
                 AsbestosSites.tenant_id == uuid.UUID(tenant_id),
             )
         )
-    ).first()
+    ).one_or_none()
     if site is None:
         raise NotFoundError("Site not found in register.")
     return site
@@ -117,7 +125,7 @@ async def _require_site_by_external_id(
                 AsbestosSites.tenant_id == uuid.UUID(tenant_id),
             )
         )
-    ).first()
+    ).one_or_none()
     if site is None:
         raise NotFoundError(f"No asbestos register entry found for site '{site_id}'.")
     return site
@@ -130,7 +138,6 @@ async def _validate_active_type(session: AsyncSession, model, type_id: str, labe
 
 
 async def _resolve_for_entry(tenant_id: str, entry: AsbestosAcmEntries) -> ResolvedNames:
-    from backend.integrations.mainsubsys import MainSubSysClient
 
     async with MainSubSysClient(tenant_id) as mss:
         return await mss.resolve_all(
@@ -158,7 +165,7 @@ async def create_entry(
         condition=body.condition.value,
         risk_score=body.riskScore.value,
         notes=body.notes,
-        status="ACTIVE",
+        status=AcmStatus.ACTIVE.value,
         created_by=uid,
         updated_by=uid,
     )
@@ -215,7 +222,7 @@ async def create_entry_with_attachments(
         condition=body.condition.value,
         risk_score=body.riskScore.value,
         notes=body.notes,
-        status="ACTIVE",
+        status=AcmStatus.ACTIVE.value,
         created_by=uid,
         updated_by=uid,
     )
@@ -453,6 +460,10 @@ async def set_status(
     status: str,
     user_id: str,
 ) -> AcmEntry:
+    # Defense in depth: never persist a status outside the allowed set, even if a
+    # future caller bypasses the router's request-model validation.
+    if status not in (AcmStatus.ACTIVE.value, AcmStatus.REMEDIATED.value):
+        raise ValidationError(f"Invalid ACM status '{status}'.")
     entry = await _load_entry(session, site_id, acm_id, tenant_id)
     previous = entry.status
     entry.status = status
@@ -460,7 +471,7 @@ async def set_status(
 
     action = (
         AuditAction.ACM_ENTRY_REACTIVATED
-        if status == "ACTIVE"
+        if status == AcmStatus.ACTIVE.value
         else AuditAction.ACM_ENTRY_MARKED_REMEDIATED
     )
     await audit_service.record(
@@ -598,17 +609,20 @@ async def attachment_download_url(
     return await storage.presigned_url(att.file_url)
 
 
+def _compute_discrepancy(entry: AsbestosAcmEntries, resolved: ResolvedNames) -> bool:
+    """An ACM's asset is discrepant when it is removed (None) OR suspended upstream."""
+    if not entry.asset_id:
+        return False
+    aid = str(entry.asset_id)
+    return resolved.asset(aid) is None or resolved.is_asset_suspended(aid)
+
+
 async def _entry_to_active_view(
     entry: AsbestosAcmEntries,
     resolved_assets: dict[str, str | None],
     resolved_users: dict[str, str | None],
-) -> "ActiveAcmEntryView":
-    from backend.core import rag as _rag
-    from backend.domains.acm_entries.acm_entries_models import (
-        ActiveAcmAttachmentView,
-        ActiveAcmEntryView,
-    )
-
+    discrepancy: bool | None = None,
+) -> ActiveAcmEntryView:
     attachments = [
         ActiveAcmAttachmentView(
             id=str(a.id),
@@ -623,11 +637,12 @@ async def _entry_to_active_view(
         roomLocation=entry.room_location,
         assetId=str(entry.asset_id) if entry.asset_id else None,
         assetName=resolved_assets.get(str(entry.asset_id)) if entry.asset_id else None,
-        assetDiscrepancy=entry.asset_discrepancy,
+        # Computed live at read time; reads never write to the DB.
+        assetDiscrepancy=entry.asset_discrepancy if discrepancy is None else discrepancy,
         acmType=entry.acm_type.name if entry.acm_type else None,
         condition=entry.condition,
         riskScore=entry.risk_score,
-        riskRag=_rag.risk_rag(entry.risk_score).value,
+        riskRag=rag.risk_rag(entry.risk_score).value,
         notes=entry.notes,
         status=entry.status,
         updatedAt=entry.updated_at,
@@ -645,16 +660,12 @@ async def list_active_entries(
     status_filter: str = "active",
     page: int = 0,
     page_size: int = 20,
-) -> "ActiveAcmEntriesResponse":
+) -> ActiveAcmEntriesResponse:
     """Return ACM entries for a site with presigned attachment URLs.
 
     status_filter: ``"active"`` returns only ACTIVE entries (default);
                    ``"all"`` returns entries of every status.
     """
-    from sqlalchemy import func
-
-    from backend.domains.acm_entries.acm_entries_models import ActiveAcmEntriesResponse
-
     page = max(0, page)
     page_size = max(1, min(page_size, 50))
 
@@ -665,7 +676,7 @@ async def list_active_entries(
         AsbestosAcmEntries.tenant_id == uuid.UUID(tenant_id),
     ]
     if status_filter.lower() == "active":
-        base_where.append(AsbestosAcmEntries.status == "ACTIVE")
+        base_where.append(AsbestosAcmEntries.status == AcmStatus.ACTIVE.value)
 
     total_count = await session.scalar(
         select(func.count()).where(*base_where)
@@ -692,27 +703,21 @@ async def list_active_entries(
     user_ids = {str(e.updated_by) for e in entries}
     resolved_assets: dict[str, str | None] = {}
     resolved_users: dict[str, str | None] = {}
+    resolved = ResolvedNames()
     if asset_ids or user_ids:
-        from backend.integrations.mainsubsys import MainSubSysClient
-
         async with MainSubSysClient(tenant_id) as mss:
             resolved = await mss.resolve_all(asset_ids=asset_ids, user_ids=user_ids)
             resolved_assets = {aid: resolved.asset(aid) for aid in asset_ids}
             resolved_users = {uid: resolved.user(uid) for uid in user_ids}
 
-    # Detect and persist asset discrepancy changes.
-    # An asset resolving to None means it is no longer active/linked in Joblogic.
-    dirty = False
-    for e in entries:
-        if e.asset_id:
-            discrepancy = resolved_assets.get(str(e.asset_id)) is None
-            if discrepancy != e.asset_discrepancy:
-                e.asset_discrepancy = discrepancy
-                dirty = True
-    if dirty:
-        await session.commit()
-
-    views = [await _entry_to_active_view(e, resolved_assets, resolved_users) for e in entries]
+    # Discrepancy is computed live for the response — a GET never mutates the DB.
+    # (Persisting the flag is the job of the write paths / a scheduled job.)
+    views = [
+        await _entry_to_active_view(
+            e, resolved_assets, resolved_users, _compute_discrepancy(e, resolved)
+        )
+        for e in entries
+    ]
     return ActiveAcmEntriesResponse(
         acmEntries=views,
         totalCount=int(total_count or 0),
@@ -725,15 +730,11 @@ async def check_asset_acm_link(
     session: AsyncSession, *, tenant_id: str, asset_id: str
 ):
     """Return whether a JobLogic asset is linked to any active ACM entry for this tenant."""
-    from sqlalchemy import func
-
-    from backend.domains.acm_entries.acm_entries_models import AssetAcmLinkResponse
-
     count = await session.scalar(
         select(func.count()).where(
             AsbestosAcmEntries.tenant_id == uuid.UUID(tenant_id),
             AsbestosAcmEntries.asset_id == uuid.UUID(asset_id),
-            AsbestosAcmEntries.status == "ACTIVE",
+            AsbestosAcmEntries.status == AcmStatus.ACTIVE.value,
         )
     )
     active_count = int(count or 0)
@@ -746,17 +747,12 @@ async def check_asset_acm_link(
 
 async def get_asset_acm_mapping(
     session: AsyncSession, *, tenant_id: str, site_id: str
-) -> "AssetAcmMappingResponse":
+) -> AssetAcmMappingResponse:
     """Return a per-asset grouping of active ACM entries for a site.
 
     ``site_id`` is the external MainSubSys site UUID (AsbestosSites.site_id).
     The internal asbestos_site_id is resolved from the asbestos_sites table first.
     """
-    from backend.domains.acm_entries.acm_entries_models import (
-        AssetAcmItem,
-        AssetAcmMappingResponse,
-    )
-
     asbestos_site = await _require_site_by_external_id(session, site_id, tenant_id)
     asbestos_site_id = asbestos_site.id
 
@@ -767,7 +763,7 @@ async def get_asset_acm_mapping(
                 .where(
                     AsbestosAcmEntries.asbestos_site_id == asbestos_site_id,
                     AsbestosAcmEntries.tenant_id == uuid.UUID(tenant_id),
-                    AsbestosAcmEntries.status == "ACTIVE",
+                    AsbestosAcmEntries.status == AcmStatus.ACTIVE.value,
                     AsbestosAcmEntries.asset_id.is_not(None),
                 )
                 .options(
@@ -784,32 +780,25 @@ async def get_asset_acm_mapping(
     user_ids = {str(e.updated_by) for e in entries}
     resolved_assets: dict[str, str | None] = {}
     resolved_users: dict[str, str | None] = {}
+    resolved = ResolvedNames()
     if asset_ids or user_ids:
-        from backend.integrations.mainsubsys import MainSubSysClient
-
         async with MainSubSysClient(tenant_id) as mss:
             resolved = await mss.resolve_all(asset_ids=asset_ids, user_ids=user_ids)
             resolved_assets = {aid: resolved.asset(aid) for aid in asset_ids}
             resolved_users = {uid: resolved.user(uid) for uid in user_ids}
 
-    # Detect and persist asset discrepancy changes.
-    dirty = False
-    for e in entries:
-        if e.asset_id:
-            discrepancy = resolved_assets.get(str(e.asset_id)) is None
-            if discrepancy != e.asset_discrepancy:
-                e.asset_discrepancy = discrepancy
-                dirty = True
-    if dirty:
-        await session.commit()
-
-    # Group by asset_id preserving insertion order.
+    # Group by asset_id preserving insertion order. Discrepancy is computed live
+    # for the response — a GET never mutates the DB.
     grouped: dict[str, list] = {}
     for entry in entries:
         aid = str(entry.asset_id)
         if aid not in grouped:
             grouped[aid] = []
-        grouped[aid].append(await _entry_to_active_view(entry, resolved_assets, resolved_users))
+        grouped[aid].append(
+            await _entry_to_active_view(
+                entry, resolved_assets, resolved_users, _compute_discrepancy(entry, resolved)
+            )
+        )
 
     mapping = [
         AssetAcmItem(

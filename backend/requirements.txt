@@ -37,3 +37,4 @@ cryptography==44.0.2
 pytest==8.3.4
 pytest-asyncio==0.25.0
 aiosqlite==0.20.0
+httpx==0.28.1

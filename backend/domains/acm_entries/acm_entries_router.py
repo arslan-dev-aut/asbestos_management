@@ -1,4 +1,9 @@
-"""ACM entry endpoints (Section 4.4)."""
+"""ACM entry endpoints (Section 4.4).
+
+Handlers are thin: request-model / enum construction failures are mapped to a
+``ValidationError`` (a ``DomainError``); everything else is handled by the
+app-level exception handlers. No generic ``except Exception`` blocks.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.config import get_settings
 from backend.core.enums import Condition, RiskScore
 from backend.core.validation import validate_uuid
-from backend.database.exceptions import DomainError, UpstreamError, ValidationError
+from backend.database.exceptions import ValidationError
 from backend.database.postgres import get_session
 from backend.domains.acm_entries import acm_entries_service as svc
 from backend.domains.acm_entries.acm_entries_models import (
@@ -37,6 +42,14 @@ async def _read_upload(file: UploadFile, index: int) -> bytes:
     return data
 
 
+async def _read_uploads(files: list[UploadFile]) -> list[tuple[str, str | None, bytes]]:
+    file_data: list[tuple[str, str | None, bytes]] = []
+    for i, file in enumerate(files):
+        data = await _read_upload(file, i)
+        file_data.append((file.filename or "upload", file.content_type, data))
+    return file_data
+
+
 @router.post("/{asbestos_site_id}/acm", response_model=AcmEntryResponse, status_code=201)
 async def create_acm(
     asbestos_site_id: str,
@@ -56,7 +69,7 @@ async def create_acm(
     validate_uuid(buildingTypeId, "buildingTypeId")
     validate_uuid(acmTypeId, "acmTypeId")
     # Drop empty-string parts (curl -F 'files=' sends a blank entry instead of a real file).
-    files = [f for f in files if hasattr(f, "read") and f.filename]
+    files = [f for f in files if f.filename]
     try:
         body = CreateAcmRequest(
             buildingTypeId=buildingTypeId,
@@ -67,28 +80,19 @@ async def create_acm(
             riskScore=RiskScore(riskScore),
             notes=notes or None,
         )
-    except (ValueError, Exception) as exc:
+    except ValueError as exc:
         raise ValidationError(str(exc)) from exc
 
-    try:
-        file_data: list[tuple[str, str | None, bytes]] = []
-        for i, file in enumerate(files):
-            data = await _read_upload(file, i)
-            file_data.append((file.filename or "upload", file.content_type, data))
-
-        entry = await svc.create_entry_with_attachments(
-            session,
-            tenant_id=ctx.tenant_id,
-            site_id=asbestos_site_id,
-            body=body,
-            user_id=ctx.user_id,
-            files=file_data,
-        )
-        return AcmEntryResponse(acmEntry=entry, message="ACM entry created.")
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to create ACM entry.", detail=str(exc)) from exc
+    file_data = await _read_uploads(files)
+    entry = await svc.create_entry_with_attachments(
+        session,
+        tenant_id=ctx.tenant_id,
+        site_id=asbestos_site_id,
+        body=body,
+        user_id=ctx.user_id,
+        files=file_data,
+    )
+    return AcmEntryResponse(acmEntry=entry, message="ACM entry created.")
 
 
 @router.put("/{asbestos_site_id}/acm/{acm_entry_id}", response_model=AcmEntryResponse)
@@ -115,7 +119,7 @@ async def update_acm(
     validate_uuid(acm_entry_id, "acmEntryId")
     validate_uuid(buildingTypeId, "buildingTypeId")
     validate_uuid(acmTypeId, "acmTypeId")
-    files = [f for f in files if hasattr(f, "read") and f.filename]
+    files = [f for f in files if f.filename]
 
     try:
         body = UpdateAcmRequest(
@@ -127,37 +131,28 @@ async def update_acm(
             riskScore=RiskScore(riskScore),
             notes=notes or None,
         )
-    except (ValueError, Exception) as exc:
+    except ValueError as exc:
         raise ValidationError(str(exc)) from exc
 
     try:
-        remove_ids: list[str] = json.loads(removeAttachmentIds)
+        remove_ids = json.loads(removeAttachmentIds)
         if not isinstance(remove_ids, list):
             raise ValueError
     except (ValueError, TypeError) as exc:
         raise ValidationError("removeAttachmentIds must be a JSON array of ID strings.") from exc
 
-    try:
-        file_data: list[tuple[str, str | None, bytes]] = []
-        for i, file in enumerate(files):
-            data = await _read_upload(file, i)
-            file_data.append((file.filename or "upload", file.content_type, data))
-
-        entry = await svc.update_entry_with_attachments(
-            session,
-            tenant_id=ctx.tenant_id,
-            site_id=asbestos_site_id,
-            acm_id=acm_entry_id,
-            body=body,
-            user_id=ctx.user_id,
-            files=file_data,
-            remove_attachment_ids=remove_ids,
-        )
-        return AcmEntryResponse(acmEntry=entry)
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to update ACM entry.", detail=str(exc)) from exc
+    file_data = await _read_uploads(files)
+    entry = await svc.update_entry_with_attachments(
+        session,
+        tenant_id=ctx.tenant_id,
+        site_id=asbestos_site_id,
+        acm_id=acm_entry_id,
+        body=body,
+        user_id=ctx.user_id,
+        files=file_data,
+        remove_attachment_ids=remove_ids,
+    )
+    return AcmEntryResponse(acmEntry=entry)
 
 
 @router.patch("/{asbestos_site_id}/acm/{acm_entry_id}/status", response_model=AcmEntryResponse)
@@ -170,20 +165,15 @@ async def set_acm_status(
 ) -> AcmEntryResponse:
     validate_uuid(asbestos_site_id, "asbestosSiteId")
     validate_uuid(acm_entry_id, "acmEntryId")
-    try:
-        entry = await svc.set_status(
-            session,
-            tenant_id=ctx.tenant_id,
-            site_id=asbestos_site_id,
-            acm_id=acm_entry_id,
-            status=body.status,
-            user_id=ctx.user_id,
-        )
-        return AcmEntryResponse(acmEntry=entry)
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to update ACM entry status.", detail=str(exc)) from exc
+    entry = await svc.set_status(
+        session,
+        tenant_id=ctx.tenant_id,
+        site_id=asbestos_site_id,
+        acm_id=acm_entry_id,
+        status=body.status,
+        user_id=ctx.user_id,
+    )
+    return AcmEntryResponse(acmEntry=entry)
 
 
 @router.get("/{asbestos_site_id}/acm", response_model=ActiveAcmEntriesResponse)
@@ -197,19 +187,14 @@ async def list_active_acm_entries(
 ) -> ActiveAcmEntriesResponse:
     """ACM entries for a site. statusFilter: ``active`` (default) or ``all``."""
     validate_uuid(asbestos_site_id, "asbestosSiteId")
-    try:
-        return await svc.list_active_entries(
-            session,
-            tenant_id=ctx.tenant_id,
-            site_id=asbestos_site_id,
-            status_filter=statusFilter,
-            page=page,
-            page_size=pageSize,
-        )
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to retrieve ACM entries.", detail=str(exc)) from exc
+    return await svc.list_active_entries(
+        session,
+        tenant_id=ctx.tenant_id,
+        site_id=asbestos_site_id,
+        status_filter=statusFilter,
+        page=page,
+        page_size=pageSize,
+    )
 
 
 @router.get("/assets/{asset_id}/check-asset-acm-link", response_model=AssetAcmLinkResponse)
@@ -220,14 +205,7 @@ async def check_asset_acm_link(
 ) -> AssetAcmLinkResponse:
     """Check whether a JobLogic asset is linked to any active ACM entry for this tenant."""
     validate_uuid(asset_id, "assetId")
-    try:
-        return await svc.check_asset_acm_link(
-            session, tenant_id=ctx.tenant_id, asset_id=asset_id
-        )
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to check asset ACM link.", detail=str(exc)) from exc
+    return await svc.check_asset_acm_link(session, tenant_id=ctx.tenant_id, asset_id=asset_id)
 
 
 @router.get("/{site_id}/asset-acm-mapping", response_model=AssetAcmMappingResponse)
@@ -242,14 +220,7 @@ async def get_asset_acm_mapping(
     Only entries with a linked asset are included.
     """
     validate_uuid(site_id, "siteId")
-    try:
-        return await svc.get_asset_acm_mapping(
-            session, tenant_id=ctx.tenant_id, site_id=site_id
-        )
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to retrieve asset-ACM mapping.", detail=str(exc)) from exc
+    return await svc.get_asset_acm_mapping(session, tenant_id=ctx.tenant_id, site_id=site_id)
 
 
 @router.get(
@@ -266,16 +237,11 @@ async def download_attachment(
     validate_uuid(asbestos_site_id, "asbestosSiteId")
     validate_uuid(acm_entry_id, "acmEntryId")
     validate_uuid(attachment_id, "attachmentId")
-    try:
-        url = await svc.attachment_download_url(
-            session,
-            tenant_id=ctx.tenant_id,
-            site_id=asbestos_site_id,
-            acm_id=acm_entry_id,
-            attachment_id=attachment_id,
-        )
-        return PresignedUrlResponse(url=url)
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to generate attachment download URL.", detail=str(exc)) from exc
+    url = await svc.attachment_download_url(
+        session,
+        tenant_id=ctx.tenant_id,
+        site_id=asbestos_site_id,
+        acm_id=acm_entry_id,
+        attachment_id=attachment_id,
+    )
+    return PresignedUrlResponse(url=url)

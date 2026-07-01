@@ -7,16 +7,16 @@ the register persists IDs only. Free-text search is resolved to IDs first.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
 
 from sqlalchemy import Select, and_, case, false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from backend.core import rag
+from backend.core import rag, storage
 from backend.core.enums import (
     CONDITION_LABELS,
     RISK_LABELS,
+    AcmStatus,
     AuditAction,
     AuditType,
     DocType,
@@ -34,6 +34,7 @@ from backend.domains.documents.documents_service import DocumentInput, _save_doc
 from backend.domains.register.register_models import (
     RegisterCustomerItem,
     RegisterSiteItem,
+    SiteAsbestosStatusResponse,
     SiteDetail,
     SiteDetailResponse,
     SiteExistsResponse,
@@ -44,11 +45,14 @@ from backend.integrations.mainsubsys import MainSubSysClient
 
 _RANK_TO_HIGHEST = {0: HighestRisk.NONE, 1: HighestRisk.LOW, 2: HighestRisk.MEDIUM, 3: HighestRisk.HIGH}
 _RISK_FILTER_TO_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
-_VALID_SORT = {"ampExpiry", "highestRisk", "lastUpdated"}
+# Sort keys the router accepts → the column they sort on. Customer/site *names*
+# live upstream (not in the DB) so they cannot be SQL-sorted; those keys fall
+# back to last-updated rather than silently pretending to sort by name.
+_SORT_DIR_DEFAULT = "desc"
 
 
 def _acm_agg_subquery():
-    active = AsbestosAcmEntries.status == "ACTIVE"
+    active = AsbestosAcmEntries.status == AcmStatus.ACTIVE.value
     return (
         select(
             AsbestosAcmEntries.asbestos_site_id.label("site_id"),
@@ -129,8 +133,6 @@ async def list_sites(
     page_index: int,
     page_size: int,
 ) -> tuple[list[SiteListItem], int]:
-    if sort_by not in _VALID_SORT:
-        sort_by = "lastUpdated"
     descending = sort_dir.lower() != "asc"
     page_size = max(1, min(page_size, 50))
     page_index = max(0, page_index)
@@ -169,12 +171,16 @@ async def list_sites(
     # Total count over the same filters.
     total_count = await session.scalar(select(func.count()).select_from(base.subquery()))
 
-    # Ordering.
+    # Ordering. name/customerName can't be SQL-sorted (names are upstream) and
+    # fall back to last-updated; every router-allowed key is handled explicitly.
     sort_target = {
         "ampExpiry": amp_sq.c.amp_expiry,
+        "riskScore": rank_col,
         "highestRisk": rank_col,
         "lastUpdated": AsbestosSites.updated_at,
-    }[sort_by]
+        "name": AsbestosSites.updated_at,
+        "customerName": AsbestosSites.updated_at,
+    }.get(sort_by, AsbestosSites.updated_at)
     base = base.order_by(sort_target.desc() if descending else sort_target.asc())
     base = base.offset(page_index * page_size).limit(page_size)
 
@@ -313,7 +319,7 @@ async def export_rows(
                 e.acm_type.name if e.acm_type else "",
                 CONDITION_LABELS.get(e.condition, e.condition),
                 RISK_LABELS.get(e.risk_score, e.risk_score),
-                "Active" if e.status == "ACTIVE" else "Remediated",
+                "Active" if e.status == AcmStatus.ACTIVE.value else "Remediated",
                 e.updated_at.isoformat(),
                 resolved.user(str(e.updated_by)) or str(e.updated_by),
             ]
@@ -329,32 +335,46 @@ async def list_register_customers(
     page_index: int,
     page_size: int,
 ) -> tuple[list[RegisterCustomerItem], int]:
-    """Return a paginated, searchable list of distinct customers in the register."""
-    stmt = (
+    """Return a paginated, searchable list of distinct customers in the register.
+
+    Paginates the distinct IDs in SQL and resolves names for the current page
+    only — never the whole tenant (which would be one upstream call per row).
+    """
+    page_index = max(0, page_index)
+    page_size = max(1, min(page_size, 50))
+
+    base = (
         select(AsbestosSites.customer_id)
         .where(AsbestosSites.tenant_id == uuid.UUID(tenant_id))
         .distinct()
     )
-    customer_uuids = (await session.scalars(stmt)).all()
-    if not customer_uuids:
-        return [], 0
+    # Search is by name → resolve to IDs upstream, then filter in SQL.
+    if search and search.strip():
+        async with MainSubSysClient(tenant_id) as mss:
+            match_ids = set(await mss.search_customer_ids(search.strip()))
+        if not match_ids:
+            return [], 0
+        base = base.where(AsbestosSites.customer_id.in_([uuid.UUID(c) for c in match_ids]))
 
-    customer_id_set = {str(c) for c in customer_uuids}
+    total = await session.scalar(select(func.count()).select_from(base.subquery()))
+    page_ids = (
+        await session.scalars(
+            base.order_by(AsbestosSites.customer_id)
+            .offset(page_index * page_size)
+            .limit(page_size)
+        )
+    ).all()
+    if not page_ids:
+        return [], int(total or 0)
+
+    id_set = {str(c) for c in page_ids}
     async with MainSubSysClient(tenant_id) as mss:
-        name_map = await mss.resolve_customers(customer_id_set)
-
-    items: list[RegisterCustomerItem] = []
-    needle = search.strip().lower() if search and search.strip() else None
-    for cid in customer_id_set:
-        name = name_map.get(cid)
-        if needle and (name is None or needle not in name.lower()):
-            continue
-        items.append(RegisterCustomerItem(customerId=cid, customerName=name))
-
-    items.sort(key=lambda x: (x.customerName or "").lower())
-    total = len(items)
-    start = page_index * page_size
-    return items[start : start + page_size], total
+        name_map = await mss.resolve_customers(id_set)
+    items = [
+        RegisterCustomerItem(customerId=str(c), customerName=name_map.get(str(c)))
+        for c in page_ids
+    ]
+    return items, int(total or 0)
 
 
 async def list_register_sites(
@@ -365,32 +385,45 @@ async def list_register_sites(
     page_index: int,
     page_size: int,
 ) -> tuple[list[RegisterSiteItem], int]:
-    """Return a paginated, searchable list of distinct sites in the register."""
-    stmt = (
+    """Return a paginated, searchable list of distinct sites in the register.
+
+    Paginates the distinct IDs in SQL and resolves names for the current page
+    only — never the whole tenant.
+    """
+    page_index = max(0, page_index)
+    page_size = max(1, min(page_size, 50))
+
+    base = (
         select(AsbestosSites.site_id)
         .where(AsbestosSites.tenant_id == uuid.UUID(tenant_id))
         .distinct()
     )
-    site_uuids = (await session.scalars(stmt)).all()
-    if not site_uuids:
-        return [], 0
+    if search and search.strip():
+        async with MainSubSysClient(tenant_id) as mss:
+            match_ids = set(await mss.search_site_ids(search.strip()))
+        if not match_ids:
+            return [], 0
+        base = base.where(AsbestosSites.site_id.in_([uuid.UUID(s) for s in match_ids]))
 
-    site_id_set = {str(s) for s in site_uuids}
+    total = await session.scalar(select(func.count()).select_from(base.subquery()))
+    page_ids = (
+        await session.scalars(
+            base.order_by(AsbestosSites.site_id)
+            .offset(page_index * page_size)
+            .limit(page_size)
+        )
+    ).all()
+    if not page_ids:
+        return [], int(total or 0)
+
+    id_set = {str(s) for s in page_ids}
     async with MainSubSysClient(tenant_id) as mss:
-        name_map = await mss.resolve_sites(site_id_set)
-
-    items: list[RegisterSiteItem] = []
-    needle = search.strip().lower() if search and search.strip() else None
-    for sid in site_id_set:
-        name = name_map.get(sid)
-        if needle and (name is None or needle not in name.lower()):
-            continue
-        items.append(RegisterSiteItem(siteId=sid, siteName=name))
-
-    items.sort(key=lambda x: (x.siteName or "").lower())
-    total = len(items)
-    start = page_index * page_size
-    return items[start : start + page_size], total
+        name_map = await mss.resolve_sites(id_set)
+    items = [
+        RegisterSiteItem(siteId=str(s), siteName=name_map.get(str(s)))
+        for s in page_ids
+    ]
+    return items, int(total or 0)
 
 
 async def check_site_exists(
@@ -433,8 +466,6 @@ async def create_site_with_documents(
     4. If any step fails: delete already-uploaded blobs, DB rolls back automatically.
     5. Single commit at the end.
     """
-    from backend.core import storage as _storage
-
     try:
         customer_uuid = uuid.UUID(customer_id)
         site_uuid = uuid.UUID(site_id)
@@ -442,7 +473,10 @@ async def create_site_with_documents(
         raise ValidationError("customerId and siteId must be valid UUIDs.") from exc
 
     existing = await session.scalar(
-        select(AsbestosSites).where(AsbestosSites.site_id == site_uuid)
+        select(AsbestosSites).where(
+            AsbestosSites.site_id == site_uuid,
+            AsbestosSites.tenant_id == uuid.UUID(tenant_id),
+        )
     )
     if existing is not None:
         raise DuplicateError("This site is already in the asbestos register.")
@@ -494,7 +528,7 @@ async def create_site_with_documents(
         await session.commit()
     except Exception:
         for key in uploaded_keys:
-            await _storage.delete_object(key)
+            await storage.delete_object(key)
         raise
 
     return str(site.id)
@@ -511,7 +545,10 @@ async def create_site(
 
     # Duplicate guard.
     existing = await session.scalar(
-        select(AsbestosSites).where(AsbestosSites.site_id == site_uuid)
+        select(AsbestosSites).where(
+            AsbestosSites.site_id == site_uuid,
+            AsbestosSites.tenant_id == uuid.UUID(tenant_id),
+        )
     )
     if existing is not None:
         raise DuplicateError("This site is already in the asbestos register.")
@@ -558,57 +595,12 @@ async def _load_site(session: AsyncSession, site_id: str, tenant_id: str) -> Asb
                     AsbestosSites.tenant_id == uuid.UUID(tenant_id),
                 )
             )
-        ).first()
+        ).one_or_none()
     except ValueError as exc:
         raise NotFoundError("Site not found.") from exc
     if site is None:
         raise NotFoundError("Site not found.")
     return site
-
-
-async def _run_discrepancy_check(
-    session: AsyncSession, *, tenant_id: str, site_id: str, entries: list[AsbestosAcmEntries], user_id: str
-) -> set[str]:
-    """Validate ACM asset links against MainSubSys; flag/clear discrepancies.
-
-    Returns the set of asset IDs that still exist (for name resolution).
-    """
-    asset_ids = {str(e.asset_id) for e in entries if e.asset_id}
-    if not asset_ids:
-        return set()
-
-    async with MainSubSysClient(tenant_id) as mss:
-        existing = await mss.validate_assets(asset_ids)
-
-    changed = False
-    for entry in entries:
-        if not entry.asset_id:
-            continue
-        missing = str(entry.asset_id) not in existing
-        if missing and not entry.asset_discrepancy:
-            entry.asset_discrepancy = True
-            changed = True
-            await audit_service.record(
-                session,
-                site_id=site_id,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                audit_type=AuditType.ASBESTOS_ACM,
-                action=AuditAction.ACM_ENTRY_EDITED,
-                details={
-                    "acmEntryId": str(entry.id),
-                    "assetId": str(entry.asset_id),
-                    "assetDiscrepancy": True,
-                    "detectedAt": datetime.now(timezone.utc).isoformat(),
-                },
-            )
-        elif not missing and entry.asset_discrepancy:
-            entry.asset_discrepancy = False
-            changed = True
-
-    if changed:
-        await session.commit()
-    return existing
 
 
 async def get_detail(
@@ -626,7 +618,7 @@ async def get_detail(
                 func.coalesce(acm_agg.c.risk_rank, 0),
             ).where(acm_agg.c.site_id == site.id)
         )
-    ).first()
+    ).one_or_none()
 
     if agg_row:
         total_acm, active_acm, risk_rank = int(agg_row[0]), int(agg_row[1]), int(agg_row[2])
@@ -669,13 +661,11 @@ async def get_detail(
 
 async def get_asbestos_status(
     session: AsyncSession, *, tenant_id: str, site_id: str
-) -> "SiteAsbestosStatusResponse":
+) -> SiteAsbestosStatusResponse:
     """Return whether a site has active ACM entries and the count.
 
     ``site_id`` is the external Joblogic site UUID (AsbestosSites.site_id).
     """
-    from backend.domains.register.register_models import SiteAsbestosStatusResponse
-
     site = (
         await session.scalars(
             select(AsbestosSites).where(
@@ -683,13 +673,13 @@ async def get_asbestos_status(
                 AsbestosSites.tenant_id == uuid.UUID(tenant_id),
             )
         )
-    ).first()
+    ).one_or_none()
     if site is None:
         return SiteAsbestosStatusResponse(hasActiveAcm=False, activeAcmCount=0)
     count = await session.scalar(
         select(func.count()).where(
             AsbestosAcmEntries.asbestos_site_id == site.id,
-            AsbestosAcmEntries.status == "ACTIVE",
+            AsbestosAcmEntries.status == AcmStatus.ACTIVE.value,
         )
     )
     active_count = count or 0

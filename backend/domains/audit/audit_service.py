@@ -36,8 +36,12 @@ async def record(
     asbestos_site_id = NULL. Site-scoped actions (ACM entries, documents, etc.)
     must pass a site_id.
     """
+    if not tenant_id:
+        # Never invent a tenant — a misfiled audit row is silent compliance-trail
+        # corruption (it becomes invisible to every tenant-scoped query).
+        raise ValidationError("tenant_id is required to record an audit entry.")
     entry = AsbestosAuditLog(
-        tenant_id=uuid.UUID(str(tenant_id)) if tenant_id else uuid.uuid4(),
+        tenant_id=uuid.UUID(str(tenant_id)),
         asbestos_site_id=uuid.UUID(str(site_id)) if site_id else None,
         user_id=uuid.UUID(str(user_id)),
         audit_type=audit_type.value,

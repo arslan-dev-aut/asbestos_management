@@ -22,12 +22,14 @@ from dataclasses import dataclass, field
 
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.enums import (
     ALLOWED_BULK_EXT,
     CONDITION_BY_LABEL,
     RISK_BY_LABEL,
+    AcmStatus,
     AuditAction,
     AuditType,
     Condition,
@@ -96,11 +98,16 @@ class _PlanRow:
 
 @dataclass
 class _Plan:
+    tenant_id: str = ""
+    created_by: str = ""
     rows: list[_PlanRow] = field(default_factory=list)
     site_ids: set[str] = field(default_factory=set)  # distinct resolved site ids
     expires_at: float = 0.0
 
 
+# In-process plan cache keyed by uploadToken. Tenant-bound and TTL'd. Note: this
+# is per-replica — a validate/confirm pair must hit the same instance. For a
+# multi-replica deployment move this to Redis (no schema change required).
 _PLAN_CACHE: dict[str, _Plan] = {}
 
 
@@ -143,25 +150,37 @@ def _read_rows(file_name: str, data: bytes) -> list[dict[str, str]]:
     if ext not in ALLOWED_BULK_EXT:
         raise ValidationError("Only CSV and XLSX files are accepted.")
 
+    max_rows = get_settings().max_bulk_rows
+
     if ext == ".csv":
         text = data.decode("utf-8-sig", errors="replace")
         reader = csv.DictReader(io.StringIO(text))
-        return [{(k or "").strip(): (v or "").strip() for k, v in row.items()} for row in reader]
+        rows: list[dict[str, str]] = []
+        for row in reader:
+            if len(rows) >= max_rows:
+                raise ValidationError(f"File exceeds the maximum of {max_rows} rows.")
+            rows.append({(k or "").strip(): (v or "").strip() for k, v in row.items()})
+        return rows
 
     wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    ws = wb.active
-    rows_iter = ws.iter_rows(values_only=True)
     try:
-        header = [str(h).strip() if h is not None else "" for h in next(rows_iter)]
-    except StopIteration:
-        return []
-    out: list[dict[str, str]] = []
-    for raw in rows_iter:
-        if raw is None or all(c is None or str(c).strip() == "" for c in raw):
-            continue
-        row = {header[i]: ("" if v is None else str(v).strip()) for i, v in enumerate(raw) if i < len(header)}
-        out.append(row)
-    return out
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+        try:
+            header = [str(h).strip() if h is not None else "" for h in next(rows_iter)]
+        except StopIteration:
+            return []
+        out: list[dict[str, str]] = []
+        for raw in rows_iter:
+            if raw is None or all(c is None or str(c).strip() == "" for c in raw):
+                continue
+            if len(out) >= max_rows:
+                raise ValidationError(f"File exceeds the maximum of {max_rows} rows.")
+            row = {header[i]: ("" if v is None else str(v).strip()) for i, v in enumerate(raw) if i < len(header)}
+            out.append(row)
+        return out
+    finally:
+        wb.close()
 
 
 def _parse_condition(value: str) -> str | None:
@@ -180,7 +199,7 @@ def _parse_risk(value: str) -> str | None:
 
 # ---- validate ----
 async def validate(
-    session: AsyncSession, *, tenant_id: str, file_name: str, data: bytes
+    session: AsyncSession, *, tenant_id: str, user_id: str, file_name: str, data: bytes
 ) -> tuple[list[BulkUploadRow], int, int, list[str], str]:
     raw_rows = _read_rows(file_name, data)
 
@@ -295,7 +314,11 @@ async def validate(
     # Case 3: site in DB  + ACM data     → VALID    (create ACM entry only)
     # Case 4: site NOT DB + ACM data     → VALID    (create site + ACM entry)
     out_rows: list[BulkUploadRow] = []
-    plan = _Plan(expires_at=time.time() + _TOKEN_TTL_SECONDS)
+    plan = _Plan(
+        tenant_id=tenant_id,
+        created_by=str(user_id),
+        expires_at=time.time() + _TOKEN_TTL_SECONDS,
+    )
     new_site_info: dict[str, tuple[str | None, str | None]] = {}
 
     allowed_conditions = list(Condition.__members__.values())
@@ -446,9 +469,13 @@ async def confirm(
     Returns (created_entries, not_created_entries, created_sites, skipped).
     """
     _prune_cache()
-    plan = _PLAN_CACHE.pop(token, None)
-    if plan is None or plan.expires_at < time.time():
+    plan = _PLAN_CACHE.get(token)
+    # Tenant-bound: a token can only be confirmed by the tenant that created it.
+    if plan is None or plan.expires_at < time.time() or plan.tenant_id != tenant_id:
         raise ValidationError("Upload token is invalid or has expired. Please re-validate.")
+
+    plan_rows = plan.rows
+    plan_site_ids = plan.site_ids
 
     uid = uuid.UUID(str(user_id))
 
@@ -457,28 +484,18 @@ async def confirm(
         await session.scalars(
             select(AsbestosSites).where(
                 AsbestosSites.tenant_id == uuid.UUID(tenant_id),
-                AsbestosSites.site_id.in_([uuid.UUID(s) for s in plan.site_ids]),
+                AsbestosSites.site_id.in_([uuid.UUID(s) for s in plan_site_ids]),
             )
         )
     ).all()
     site_pk_by_site_id = {str(s.site_id): s.id for s in existing_rows}
 
     created_sites = 0
-    for plan_row in plan.rows:
+    for plan_row in plan_rows:
         if plan_row.site_id in site_pk_by_site_id:
             continue
-        # Guard against race: site may have been created after validate ran.
-        already = (
-            await session.scalars(
-                select(AsbestosSites).where(
-                    AsbestosSites.tenant_id == uuid.UUID(tenant_id),
-                    AsbestosSites.site_id == uuid.UUID(plan_row.site_id),
-                )
-            )
-        ).first()
-        if already is not None:
-            site_pk_by_site_id[plan_row.site_id] = already.id
-            continue
+        # Insert inside a savepoint; if a concurrent confirm/registration won the
+        # race the unique constraint fires and we adopt the existing row.
         site = AsbestosSites(
             tenant_id=uuid.UUID(tenant_id),
             site_id=uuid.UUID(plan_row.site_id),
@@ -486,8 +503,23 @@ async def confirm(
             created_by=uid,
             updated_by=uid,
         )
-        session.add(site)
-        await session.flush()
+        try:
+            async with session.begin_nested():
+                session.add(site)
+                await session.flush()
+        except IntegrityError:
+            existing = (
+                await session.scalars(
+                    select(AsbestosSites).where(
+                        AsbestosSites.tenant_id == uuid.UUID(tenant_id),
+                        AsbestosSites.site_id == uuid.UUID(plan_row.site_id),
+                    )
+                )
+            ).one_or_none()
+            if existing is None:
+                raise
+            site_pk_by_site_id[plan_row.site_id] = existing.id
+            continue
         site_pk_by_site_id[plan_row.site_id] = site.id
         created_sites += 1
         await audit_service.record(
@@ -506,7 +538,7 @@ async def confirm(
     created_entries = 0
     skipped: list[SkippedEntry] = []
 
-    for plan_row in plan.rows:
+    for plan_row in plan_rows:
         site_pk = site_pk_by_site_id.get(plan_row.site_id)
         if site_pk is None:
             skipped.append(SkippedEntry(
@@ -529,7 +561,7 @@ async def confirm(
             condition=plan_row.condition,
             risk_score=plan_row.risk_score,
             notes=plan_row.notes,
-            status="ACTIVE",
+            status=AcmStatus.ACTIVE.value,
             created_by=uid,
             updated_by=uid,
         )
@@ -555,6 +587,9 @@ async def confirm(
         )
 
     await session.commit()
+    # Consume the token only after a successful commit — if the commit raised,
+    # the plan stays in the cache and the user can retry.
+    _PLAN_CACHE.pop(token, None)
     return created_entries, len(skipped), created_sites, skipped
 
 
@@ -576,18 +611,35 @@ EXPORT_COLUMNS = [
 ]
 
 
+# Leading characters that spreadsheet apps interpret as the start of a formula.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _formula_safe(value) -> str:
+    """Neutralise CSV/spreadsheet formula injection.
+
+    A cell beginning with =, +, -, @ (or tab/CR) is executed by Excel/Sheets on
+    open. Prefixing with a single quote forces it to be treated as text.
+    """
+    s = "" if value is None else str(value)
+    if s and s[0] in _FORMULA_PREFIXES:
+        return "'" + s
+    return s
+
+
 def build_export(rows: list[list[str]], fmt: str) -> tuple[bytes, str, str]:
+    safe_rows = [[_formula_safe(cell) for cell in row] for row in rows]
     if fmt == "csv":
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(EXPORT_COLUMNS)
-        writer.writerows(rows)
+        writer.writerows(safe_rows)
         return buf.getvalue().encode("utf-8-sig"), "text/csv", "asbestos-register.csv"
     wb = Workbook()
     ws = wb.active
     ws.title = "Register"
     ws.append(EXPORT_COLUMNS)
-    for row in rows:
+    for row in safe_rows:
         ws.append(row)
     out = io.BytesIO()
     wb.save(out)

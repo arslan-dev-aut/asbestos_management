@@ -19,6 +19,7 @@ from sqlalchemy import (
     Index,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -66,8 +67,13 @@ class AsbestosBuildingTypes(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+
+    # Names are unique PER TENANT, not globally.
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_building_types_tenant_name"),
+    )
 
 
 class AsbestosAcmTypes(Base, TimestampMixin):
@@ -75,8 +81,13 @@ class AsbestosAcmTypes(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+
+    # Names are unique PER TENANT, not globally.
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_acm_types_tenant_name"),
+    )
 
 
 class AsbestosSites(Base, TimestampMixin):
@@ -84,7 +95,7 @@ class AsbestosSites(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    site_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    site_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
 
     documents: Mapped[list[AsbestosSiteDocuments]] = relationship(
@@ -94,7 +105,11 @@ class AsbestosSites(Base, TimestampMixin):
         back_populates="site", cascade="all, delete-orphan"
     )
 
-    __table_args__ = (Index("idx_asbestos_sites_customer", "customer_id"),)
+    # A JobLogic site is registered at most once PER TENANT (not globally).
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "site_id", name="uq_asbestos_sites_tenant_site"),
+        Index("idx_asbestos_sites_customer", "customer_id"),
+    )
 
 
 class AsbestosSiteDocuments(Base, UploadedMixin):

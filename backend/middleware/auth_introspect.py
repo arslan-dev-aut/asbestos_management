@@ -82,7 +82,8 @@ async def close_http_session() -> None:
 _TOKEN_CACHE_FALLBACK_TTL = 60
 _TOKEN_CACHE_SAFETY_BUFFER = 30
 _TOKEN_CACHE_MAX = 500
-_token_cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
+# Value: (db_user_id, verified_tenant_id, expires_at_monotonic)
+_token_cache: OrderedDict[str, tuple[str, str, float]] = OrderedDict()
 
 # ── Cache 2: identity_user_id (sub) → db_user_id ─────────────────────────────
 # sub is a permanent identity claim — it always maps to the same DB user.
@@ -106,27 +107,38 @@ def _token_ttl(token: str) -> float:
     return _TOKEN_CACHE_FALLBACK_TTL
 
 
-def _cache_get(token: str) -> str | None:
+def _cache_get(token: str) -> tuple[str, str] | None:
+    """Return (db_user_id, verified_tenant_id) for a live cache entry, else None."""
     entry = _token_cache.get(token)
     if entry is None:
         return None
-    user_id, expires_at = entry
+    user_id, tenant_id, expires_at = entry
     if time.monotonic() > expires_at:
         _token_cache.pop(token, None)
         return None
     _token_cache.move_to_end(token)
-    return user_id
+    return user_id, tenant_id
 
 
-def _cache_set(token: str, user_id: str) -> None:
+def _cache_set(token: str, user_id: str, tenant_id: str) -> None:
     ttl = _token_ttl(token)
     if ttl <= 0:
         return
     if token in _token_cache:
         _token_cache.move_to_end(token)
-    _token_cache[token] = (user_id, time.monotonic() + ttl)
+    _token_cache[token] = (user_id, tenant_id, time.monotonic() + ttl)
     if len(_token_cache) > _TOKEN_CACHE_MAX:
         _token_cache.popitem(last=False)
+
+
+def _token_tenant(token: str, userinfo: dict, claim: str) -> str | None:
+    """Extract the tenant id the token is scoped to.
+
+    The token passed UserInfo validation, so its payload claims are authentic.
+    Prefer the claim on the UserInfo response, fall back to the token payload.
+    """
+    val = userinfo.get(claim) or _decode_claims_unverified(token).get(claim)
+    return str(val) if val else None
 
 
 def _sub_cache_get(identity_user_id: str) -> str | None:
@@ -344,10 +356,16 @@ class TokenIntrospectionMiddleware(BaseHTTPMiddleware):
             )
 
         # ── 5. Cache hit — skip both external calls ───────────────────────
-        cached_user_id = _cache_get(token)
-        if cached_user_id:
+        cached = _cache_get(token)
+        if cached:
+            cached_user_id, cached_tenant_id = cached
             if not x_tenant_id:
                 return _unauthorized("X-Tenant-Id header is required.")
+            # The header must match the tenant the token was verified against —
+            # otherwise a valid token for tenant A could act as tenant B.
+            if cached_tenant_id and str(x_tenant_id) != cached_tenant_id:
+                logger.warning("Tenant mismatch on %s: header=%s token=%s", path, x_tenant_id, cached_tenant_id)
+                return _unauthorized("X-Tenant-Id does not match the authenticated token.")
             request.state.auth_user_id = cached_user_id
             request.state.auth_tenant_id = str(x_tenant_id)
             return await call_next(request)
@@ -387,6 +405,17 @@ class TokenIntrospectionMiddleware(BaseHTTPMiddleware):
             logger.warning("UserInfo response has no sub claim: %s", userinfo)
             return _unauthorized("User identity (sub) is missing from the token.")
 
+        # ── 9b. Bind the tenant: the header must match the token's tenant ─
+        # The cold path used `pre_sub` (unverified) only to parallelise the
+        # user-detail call; re-validate it against the verified sub.
+        if pre_sub and str(pre_sub) != str(identity_user_id):
+            logger.warning("sub mismatch on %s: pre=%s verified=%s", path, pre_sub, identity_user_id)
+            user_id = None  # discard the result resolved from the unverified sub
+        token_tenant = _token_tenant(token, userinfo, settings.jwt_tenant_claim)
+        if token_tenant and str(x_tenant_id) != token_tenant:
+            logger.warning("Tenant mismatch on %s: header=%s token=%s", path, x_tenant_id, token_tenant)
+            return _unauthorized("X-Tenant-Id does not match the authenticated token.")
+
         # ── 10. Resolve DB user ID if still unknown (no pre_sub) ─────────
         if user_id is None:
             user_id = await _resolve_db_user_id(identity_user_id, settings.user_detail_api_base_url)
@@ -396,7 +425,7 @@ class TokenIntrospectionMiddleware(BaseHTTPMiddleware):
 
         # ── 11. Populate both caches and store verified identity ──────────
         _sub_cache_set(identity_user_id, str(user_id))
-        _cache_set(token, str(user_id))
+        _cache_set(token, str(user_id), str(x_tenant_id))
         request.state.auth_user_id = str(user_id)
         request.state.auth_tenant_id = str(x_tenant_id)
         logger.debug("Auth OK — identity=%s user=%s tenant=%s path=%s", identity_user_id, user_id, x_tenant_id, path)

@@ -20,13 +20,11 @@ EXPECTED_PATHS = {
     ("POST", "/api/v1/asbestos/register/{asbestos_site_id}/acm"),
     ("PUT", "/api/v1/asbestos/register/{asbestos_site_id}/acm/{acm_entry_id}"),
     ("PATCH", "/api/v1/asbestos/register/{asbestos_site_id}/acm/{acm_entry_id}/status"),
-    ("POST", "/api/v1/asbestos/register/{asbestos_site_id}/acm/{acm_entry_id}/attachments"),
     ("GET", "/api/v1/asbestos/register/bulk-upload/template"),
     ("POST", "/api/v1/asbestos/register/bulk-upload/validate"),
     ("POST", "/api/v1/asbestos/register/bulk-upload/confirm"),
     ("GET", "/api/v1/asbestos/register/export"),
     ("GET", "/api/v1/asbestos/register/{asbestos_site_id}/audit"),
-    ("POST", "/api/v1/asbestos/register/{asbestos_site_id}/qr-code"),
     ("GET", "/api/v1/asbestos/register/{asbestos_site_id}/qr-code"),
     ("GET", "/public/{token}"),
 }

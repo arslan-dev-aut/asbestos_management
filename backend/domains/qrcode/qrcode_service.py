@@ -13,7 +13,7 @@ from sqlalchemy.orm import selectinload
 
 from backend.config import get_settings
 from backend.core import rag, storage
-from backend.core.enums import DocType
+from backend.core.enums import AcmStatus, DocType
 from backend.database.db_models import (
     AsbestosAcmEntries,
     AsbestosQrCodes,
@@ -77,7 +77,7 @@ async def create_for_new_site(
                 AsbestosQrCodes.tenant_id == uuid.UUID(tenant_id),
             )
         )
-    ).first()
+    ).one_or_none()
     if existing is not None:
         return
 
@@ -98,7 +98,7 @@ async def get(session: AsyncSession, *, tenant_id: str, site_id: str) -> QrCodeR
                 AsbestosQrCodes.tenant_id == uuid.UUID(tenant_id),
             )
         )
-    ).first()
+    ).one_or_none()
     if qr is None:
         raise NotFoundError("No QR code has been generated for this site yet.")
     return await _to_response(session, tenant_id, qr)
@@ -116,7 +116,7 @@ async def public_view(
     """Unauthenticated read-only view: active ACM entries + current documents."""
     qr = (
         await session.scalars(select(AsbestosQrCodes).where(AsbestosQrCodes.token == token))
-    ).first()
+    ).one_or_none()
     if qr is None:
         raise NotFoundError("This QR code is no longer valid.")
 
@@ -126,7 +126,7 @@ async def public_view(
 
     acm_where = (
         AsbestosAcmEntries.asbestos_site_id == site.id,
-        AsbestosAcmEntries.status == "ACTIVE",
+        AsbestosAcmEntries.status == AcmStatus.ACTIVE.value,
     )
     acm_total = await session.scalar(select(func.count()).where(*acm_where)) or 0
     entries = (

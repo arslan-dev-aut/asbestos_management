@@ -22,10 +22,10 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from backend.config import get_settings
-
-_log = logging.getLogger(__name__)
 from backend.core.enums import ALLOWED_FILE_EXT, ALLOWED_FILE_MIME
 from backend.database.exceptions import UnsupportedMediaTypeError, UpstreamError
+
+_log = logging.getLogger(__name__)
 
 _service_client = None  # azure.storage.blob.aio.BlobServiceClient
 _credential = None  # azure.identity.aio credential
@@ -61,14 +61,28 @@ def _make_credential():
 # Upload validation
 # ---------------------------------------------------------------------------
 
+# Content types we treat as "unspecified" (browsers sometimes send these).
+_GENERIC_CONTENT_TYPES = {"", "application/octet-stream"}
+
+
 def validate_upload(file_name: str, content_type: str | None) -> None:
-    """Reject anything that is not PDF/JPEG/PNG (server-side enforcement)."""
+    """Reject anything that is not PDF/JPEG/PNG (server-side enforcement).
+
+    The extension must be in the allowlist (mandatory — previously a valid MIME
+    alone could smuggle ``evil.exe``), and any *specified* content type must be
+    consistent with it (so ``payload.pdf`` declared ``application/x-msdownload``
+    is rejected too). A generic/missing content type is tolerated.
+    """
     ext = os.path.splitext(file_name or "")[1].lower()
-    mime_ok = content_type in ALLOWED_FILE_MIME if content_type else False
-    ext_ok = ext in ALLOWED_FILE_EXT
-    if not (mime_ok or ext_ok):
+    if ext not in ALLOWED_FILE_EXT:
         raise UnsupportedMediaTypeError(
             "Unsupported file type. Only PDF, JPEG, and PNG are allowed.",
+            detail={"fileName": file_name, "contentType": content_type},
+        )
+    ct = (content_type or "").lower()
+    if ct not in _GENERIC_CONTENT_TYPES and ct not in ALLOWED_FILE_MIME:
+        raise UnsupportedMediaTypeError(
+            "File content type does not match an allowed type (PDF, JPEG, PNG).",
             detail={"fileName": file_name, "contentType": content_type},
         )
 
@@ -119,11 +133,12 @@ async def _ensure_container(client) -> None:
 
     try:
         await client.create_container(get_settings().azure_storage_container)
+        _ensured_container = True
     except ResourceExistsError:
-        pass
-    except Exception:  # noqa: BLE001 - container may pre-exist / be RBAC-restricted
-        pass
-    _ensured_container = True
+        _ensured_container = True
+    except Exception as exc:  # noqa: BLE001
+        # Don't latch the flag on a real failure (e.g. RBAC) — log and retry next time.
+        _log.warning("Could not ensure storage container exists: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -217,8 +232,10 @@ async def delete_object(key: str) -> None:
         settings = get_settings()
         container = client.get_container_client(settings.azure_storage_container)
         await container.delete_blob(key)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # A failed cleanup leaves an orphaned (possibly PII) blob — surface it so
+        # a reconciliation sweep can find it, rather than swallowing silently.
+        _log.warning("Failed to delete blob %r during cleanup: %s", key, exc)
 
 
 async def close_storage() -> None:

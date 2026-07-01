@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.core import storage
 from backend.core.validation import validate_uuid
 from backend.database.db_models import AsbestosAcmAttachments, AsbestosSiteDocuments
-from backend.database.exceptions import DomainError, NotFoundError, UpstreamError
+from backend.database.exceptions import NotFoundError
 from backend.database.postgres import get_session
 from backend.domains.documents.documents_models import PresignedUrlResponse
 from backend.middleware.auth import AuthContext, get_context
@@ -35,19 +35,15 @@ async def download_file(
     The file must belong to the authenticated tenant.
     """
     validate_uuid(file_id, "fileId")
-    try:
-        fid = uuid.UUID(file_id)
+    fid = uuid.UUID(file_id)
+    tenant_uuid = uuid.UUID(ctx.tenant_id)
 
-        doc = await session.get(AsbestosSiteDocuments, fid)
-        if doc and str(doc.tenant_id) == ctx.tenant_id:
-            return PresignedUrlResponse(url=await storage.presigned_url(doc.file_url))
+    doc = await session.get(AsbestosSiteDocuments, fid)
+    if doc and doc.tenant_id == tenant_uuid:
+        return PresignedUrlResponse(url=await storage.presigned_url(doc.file_url))
 
-        att = await session.get(AsbestosAcmAttachments, fid)
-        if att and str(att.tenant_id) == ctx.tenant_id:
-            return PresignedUrlResponse(url=await storage.presigned_url(att.file_url))
+    att = await session.get(AsbestosAcmAttachments, fid)
+    if att and att.tenant_id == tenant_uuid:
+        return PresignedUrlResponse(url=await storage.presigned_url(att.file_url))
 
-        raise NotFoundError("File not found.")
-    except DomainError:
-        raise
-    except Exception as exc:
-        raise UpstreamError("Failed to generate file download URL.", detail=str(exc)) from exc
+    raise NotFoundError("File not found.")
