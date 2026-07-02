@@ -1,18 +1,29 @@
 services:
   backend:
     build:
-      context: ./backend
+      context: .
+      dockerfile: Dockerfile
+      target: backend
+    restart: unless-stopped
     ports:
       - "8000:8000"
-    environment:
-      - PYTHONDONTWRITEBYTECODE=1
-      - PYTHONUNBUFFERED=1
-    env_file:
-      - path: .env
-        required: false
+    env_file: .env
     volumes:
-      - audit-data:/data
-    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+      - ./backend:/app
+      - ${USERPROFILE}/.azure:/root/.azure
 
-volumes:
-  audit-data:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    environment:
+      - BACKEND_UPSTREAM=http://backend:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules

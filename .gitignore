@@ -8,6 +8,12 @@ build/
 .venv/
 venv/
 
+.claude/
+.devcontainer/
+.pytest_cache/
+context-doc/
+js/
+
 # Environment
 .env
 .env.local

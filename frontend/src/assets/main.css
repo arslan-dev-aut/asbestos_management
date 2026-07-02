@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body {
+    @apply h-full;
+  }
+  body {
+    @apply bg-[#eef1f4] font-sans text-jl-navy antialiased;
+  }
+  #app {
+    @apply h-full;
+  }
+}
+
+@layer components {
+  /* Shared form control look matching the JobLogic prototype */
+  .jl-input {
+    @apply w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm
+           text-jl-navy placeholder-slate-400 outline-none transition
+           focus:border-jl-teal focus:ring-2 focus:ring-jl-teal/20;
+  }
+  /* Only real text inputs/textareas get the readonly style — buttons are always :read-only per spec */
+  input.jl-input:read-only,
+  textarea.jl-input:read-only {
+    @apply bg-slate-50 text-jl-navy cursor-default;
+  }
+  .jl-label {
+    @apply mb-1 block text-sm font-semibold text-jl-navy;
+  }
+  .jl-card {
+    @apply rounded-lg border border-slate-200 bg-white shadow-sm;
+  }
+}

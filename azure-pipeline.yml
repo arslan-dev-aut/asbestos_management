@@ -4,49 +4,10 @@ trigger:
       - uat
       - staging
       - main
-
-# ============================================
-# Runtime Parameters (visible when running manually)
-# ============================================
-parameters:
-
-  - name: customEnvVars
-    displayName: 'Env Vars (optional - use ;; separator: KEY1=value1;;KEY2=value2)'
-    type: string
-    default: 'none'
-
-  - name: resourceSize
-    displayName: 'Container Resources (CPU/Memory)'
-    type: string
-    default: 'default'
-    values:
-      - 'default'
-      - '0.25CPU::::0.5Gi'
-      - '0.5CPU::::1.0Gi'
-      - '1.0CPU::::2.0Gi'
-      - '2.0CPU::::4.0Gi'
-
-  - name: minReplicas
-    displayName: 'Minimum Replicas (optional)'
-    type: string
-    default: 'default'
-    values:
-      - 'default'
-      - '0'
-      - '1'
-      - '2'
-      - '3'
-      - '5'
-
-  - name: skipMergeDown
-    displayName: 'Skip Merge-Down (main→staging→uat)'
-    type: boolean
-    default: false
-
 variables:
   # Select variable groups + settings based on the branch being deployed.
   # - uat -> groups starting with `uat`
-  # - staging -> groups starting with `Stg`
+  # - staging -> groups starting with `Staging`
   # - live/main -> groups starting with `Live`
   - ${{ if eq(variables['Build.SourceBranchName'], 'uat') }}:
       - group: UATContainerAppVariables
@@ -61,94 +22,72 @@ pool:
   name: "$(poolName)"
 
 stages:
-  # ============================================
-  # Stage 1: Build & Push Docker Image
-  # ============================================
-  - template: deploy/templates/build-and-push.yml
-    parameters:
-      containerRegistry: $(containerRegistry)
-      imageName: $(CONTAINERNAME)
-      dockerfilePath: '**/Dockerfile'
-      tags: '$(Build.BuildId)'
+- stage: Build
+  displayName: Build & Push Images
+  jobs:
+    - job: BuildAndPush
+      displayName: Build & Push
+      steps:
+        - task: Docker@2
+          displayName: buildAndPush
+          inputs:
+            command: "buildAndPush"
+            containerRegistry: "$(containerRegistry)"
+            repository: "$(CONTAINERNAME)"
+            Dockerfile: "**/Dockerfile"
+            tags: |
+              $(Build.BuildId)
 
-  # ============================================
-  # Stage 2a: Deploy to Main (with approval)
-  # ============================================
-  - template: deploy/templates/deploy-container-app.yml
-    parameters:
-      stageName: DeployMain
-      displayName: 'Deploy to Azure (main, approval)'
-      azureSubscription: $(azureSubscription)
-      deployScriptPath: 'deploy/scripts/containerapp.sh'
-      dependsOn:
-        - Build
-      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-      requiresApproval: true
-      environment: 'Approval for YAML Pipelines'
-      customEnvVars: ${{ parameters.customEnvVars }}
-      resourceSize: ${{ parameters.resourceSize }}
-      minReplicas: ${{ parameters.minReplicas }}
+- stage: DeployMain
+  displayName: "Deploy to Azure (main, approval)"
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+    - deployment: Deploy
+      displayName: "Deploy to Azure Container App"
+      environment: "Approval for YAML Pipelines"
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: AzureCLI@2
+                displayName: "Deploy (Container App or Job)"
+                inputs:
+                  azureSubscription: "$(azureSubscription)" # Azure service connection
+                  scriptType: "bash"
+                  scriptLocation: "scriptPath"
+                  scriptPath: "$(Build.SourcesDirectory)/deploy/containerapp.sh"
 
-  # ============================================
-  # Stage 2b: Deploy to Non-Main (no approval)
-  # ============================================
-  - template: deploy/templates/deploy-container-app.yml
-    parameters:
-      stageName: DeployNonMain
-      displayName: 'Deploy to Azure (non-main)'
-      azureSubscription: $(azureSubscription)
-      deployScriptPath: 'deploy/scripts/containerapp.sh'
-      dependsOn:
-        - Build
-      condition: and(succeeded(), ne(variables['Build.SourceBranch'], 'refs/heads/main'))
-      requiresApproval: false
-      customEnvVars: ${{ parameters.customEnvVars }}
-      resourceSize: ${{ parameters.resourceSize }}
-      minReplicas: ${{ parameters.minReplicas }}
+- stage: DeployNonMain
+  displayName: "Deploy to Azure (non-main)"
+  dependsOn: Build
+  condition: and(succeeded(), ne(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+    - job: Deploy
+      displayName: "Deploy to Azure Container App"
+      steps:
+        - task: AzureCLI@2
+          displayName: "Deploy (Container App or Job)"
+          inputs:
+            azureSubscription: "$(azureSubscription)" # Azure service connection
+            scriptType: "bash"
+            scriptLocation: "scriptPath"
+            scriptPath: "$(Build.SourcesDirectory)/deploy/containerapp.sh"
 
-  # ============================================
-  # Stage 3: Post-Deploy Health Check (All branches)
-  # ============================================
-  - template: deploy/templates/health-check.yml
-    parameters:
-      azureSubscription: $(azureSubscription)
-      healthEndpoint: '/health'
-      expectedStatus: 200
-      expectedBodyContains: 'healthy'
-      timeoutSeconds: 120
-      retryCount: 5
-      retryDelaySeconds: 10
-      failOnUnhealthy: true
-      dependsOn: ['DeployMain', 'DeployNonMain']
-      condition: or(eq(dependencies.DeployMain.result, 'Succeeded'), eq(dependencies.DeployNonMain.result, 'Succeeded'))
+- stage: UpdateAutomationsHub
+  displayName: 'Update Container-Automations-Hub Submodule'
+  dependsOn:
+    - DeployMain
+    - DeployNonMain
+  # Run after whichever deploy stage ran successfully (other may be skipped).
+  condition: or(eq(dependencies.DeployMain.result, 'Succeeded'), eq(dependencies.DeployNonMain.result, 'Succeeded'))
+  jobs:
+    - job: UpdateHub
+      displayName: 'Create/Update submodule in hub'
+      steps:
+      - checkout: self
+        persistCredentials: true
 
-  # ============================================
-  # Stage 4: Update Hub Submodule
-  # ============================================
-  - template: deploy/templates/update-hub-submodule.yml
-    parameters:
-      scriptPath: 'deploy/scripts/update-hub-submodule.sh'
-      dependsOn: ['HealthCheck']
-      condition: eq(dependencies.HealthCheck.result, 'Succeeded')
-
-  # ============================================
-  # Stage 5: Merge-Down (main→staging, staging→uat)
-  # ============================================
-  - template: deploy/templates/merge-down.yml
-    parameters:
-      dependsOn: ['UpdateAutomationsHub']
-      condition: eq(dependencies.UpdateAutomationsHub.result, 'Succeeded')
-      skipMergeDown: ${{ parameters.skipMergeDown }}
-
-  # ============================================
-  # Stage 6: Auto-Rollback on Health Check Failure (Main only)
-  # ============================================
-  - template: deploy/templates/rollback.yml
-    parameters:
-      stageName: AutoRollback
-      displayName: 'Auto-Rollback (Health Check Failed)'
-      azureSubscription: $(azureSubscription)
-      revisionName: 'previous'
-      triggerRollback: true
-      dependsOn: ['HealthCheck']
-      condition: and(eq(dependencies.HealthCheck.result, 'Failed'), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+      - bash: |
+          bash "$(Build.SourcesDirectory)/deploy/update-hub-submodule.sh"
+        displayName: 'Update hub submodule pointer'

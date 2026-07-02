@@ -1,38 +1,20 @@
 <script setup lang="ts">
-import { RouterView } from 'vue-router'
+import { computed } from 'vue'
+import { useRoute } from 'vue-router'
+import AppShell from '@/components/layout/AppShell.vue'
+import ToastHost from '@/components/base/ToastHost.vue'
+
+const route = useRoute()
+// Public QR page renders without the JobLogic app shell
+const isPublic = computed(() => route.meta.public === true)
 </script>
 
 <template>
-  <div id="app">
-    <header>
-      <h1>Joblogic Automation</h1>
-    </header>
-    <main>
-      <RouterView />
-    </main>
-  </div>
+  <ToastHost />
+  <template v-if="isPublic">
+    <RouterView />
+  </template>
+  <AppShell v-else>
+    <RouterView />
+  </AppShell>
 </template>
-
-<style>
-:root {
-  font-family: Inter, system-ui, -apple-system, sans-serif;
-  color: #213547;
-  background-color: #ffffff;
-}
-
-body {
-  margin: 0;
-  padding: 0;
-}
-
-#app {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 2rem;
-}
-
-header h1 {
-  font-size: 1.5rem;
-  margin-bottom: 1rem;
-}
-</style>

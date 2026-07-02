@@ -2,12 +2,43 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <link rel="icon" href="/favicon.ico" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Joblogic Automation</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <title>Asbestos Register — JobLogic</title>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <!-- Shown only until Vue mounts and replaces this node -->
+      <div id="jl-boot" style="position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#f8fafc;gap:16px;font-family:Inter,sans-serif;">
+        <svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <!-- Joblogic diamond logo mark -->
+          <rect x="6" y="20" width="12" height="12" rx="2" transform="rotate(-45 6 20)" fill="#0097A7"/>
+          <rect x="18" y="8" width="12" height="12" rx="2" transform="rotate(-45 18 8)" fill="#FFC107"/>
+          <rect x="30" y="20" width="12" height="12" rx="2" transform="rotate(-45 30 20)" fill="#F44336"/>
+        </svg>
+        <p style="color:#64748b;font-size:13px;font-weight:500;letter-spacing:0.02em;">Loading Asbestos Register…</p>
+      </div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
+    <script>
+      // Remove the boot screen as soon as Vue has mounted
+      document.addEventListener('DOMContentLoaded', function () {
+        var boot = document.getElementById('jl-boot')
+        if (boot) {
+          var observer = new MutationObserver(function () {
+            var el = document.getElementById('jl-boot')
+            if (!el) { observer.disconnect(); return }
+            if (document.getElementById('app').children.length > 1 || !el.parentNode) {
+              el.remove(); observer.disconnect()
+            }
+          })
+          observer.observe(document.getElementById('app'), { childList: true })
+        }
+      })
+    </script>
   </body>
 </html>

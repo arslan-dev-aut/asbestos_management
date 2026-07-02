@@ -1,0 +1,6 @@
+{
+  "trigger_type": "manual",
+  "cpu": 0.5,
+  "memory": "1.0Gi",
+  "target_port": 80
+}
