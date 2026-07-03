@@ -35,6 +35,8 @@ def _query_sync(site_id: int) -> dict[str, Any] | None:
         user=s.sqlserver_user,
         password=s.sqlserver_password,
         as_dict=True,
+        login_timeout=30,
+        timeout=30,
     ) as conn:
         with conn.cursor(as_dict=True) as cursor:
             cursor.execute(

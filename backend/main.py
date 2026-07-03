@@ -1,89 +1,27 @@
-"""FastAPI application entry point for the B6 Asbestos Management backend.
-
-Registers domain routers under the API prefix, mounts the unauthenticated
-public QR view at the root, configures CORS, and maps domain exceptions to a
-consistent ``{success, message, detail}`` JSON envelope.
-"""
+"""FastAPI application entry point for the Asbestos Sites backend."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from backend.config import get_settings
-from backend.core.storage import close_storage
 from backend.database.exceptions import DomainError
 from backend.database.postgres import dispose_engine, get_engine
-from backend.domains.acm_entries.acm_entries_router import router as acm_entries_router
-from backend.domains.audit.audit_router import router as audit_router
-from backend.domains.bulk.bulk_router import router as bulk_router
-from backend.domains.configuration.configuration_router import router as configuration_router
-from backend.domains.documents.documents_router import router as documents_router
-from backend.domains.files.files_router import router as files_router
-from backend.domains.lookup.lookup_router import router as lookup_router
-from backend.domains.mobile.mobile_router import router as mobile_router
-from backend.domains.qrcode.qrcode_router import public_router
-from backend.domains.qrcode.qrcode_router import router as qrcode_router
 from backend.domains.asbestos_sites.asbestos_sites_router import router as asbestos_sites_router
-from backend.domains.register.register_router import router as register_router
-from backend.middleware.auth_introspect import TokenIntrospectionMiddleware, close_http_session
 
 logger = logging.getLogger("asbestos")
-
-
-def _load_app_config_eagerly() -> None:
-    """Load Automation/<name>/* from Azure App Config into the environment BEFORE
-    the app/CORS/title are built, so every setting (including CORS origins) sees
-    the production values — not just lazily-read ones.
-
-    Runs at import time when no event loop is active (the normal uvicorn case).
-    If a loop is already running (e.g. under tests), this is skipped and the
-    lifespan hook performs the load instead.
-    """
-    cfg = get_settings()
-    if not cfg.app_configuration_connection_string:
-        return
-    try:
-        asyncio.get_running_loop()
-        return  # inside a running loop — defer to lifespan
-    except RuntimeError:
-        pass
-    try:
-        from joblogic_sdk.app_config import AppConfigManager
-
-        asyncio.run(AppConfigManager.load())
-        get_settings.cache_clear()
-    except Exception as exc:  # noqa: BLE001 - surface but don't crash boot
-        logger.warning("Eager App Config load failed: %s", exc)
-
-
-_load_app_config_eagerly()
 settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Fallback load for the in-event-loop case (eager import-time load skipped).
-    cfg = get_settings()
-    if cfg.app_configuration_connection_string:
-        try:
-            from joblogic_sdk.app_config import AppConfigManager
-
-            await AppConfigManager.load()
-            get_settings.cache_clear()
-        except Exception as exc:  # noqa: BLE001 - surface but don't crash boot
-            logger.warning("App Config load failed: %s", exc)
-
-    # Pre-warm the DB connection pool so the first user request doesn't pay the
-    # cold-start cost (AAD token fetch + TCP+TLS to Azure PostgreSQL, ~4-5 s).
     try:
         engine = get_engine()
         async with engine.connect() as conn:
@@ -93,13 +31,11 @@ async def lifespan(_app: FastAPI):
 
     yield
     await dispose_engine()
-    await close_storage()
-    await close_http_session()
 
 
 app = FastAPI(
     title=settings.project_name,
-    description="B6 Asbestos Management — Register API.",
+    description="Asbestos Sites API.",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -112,10 +48,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.add_middleware(TokenIntrospectionMiddleware)
-
-
-# ---- Exception handlers ----
 
 @app.exception_handler(DomainError)
 async def _domain_error_handler(_request: Request, exc: DomainError) -> JSONResponse:
@@ -156,79 +88,10 @@ async def _unhandled_error_handler(_request: Request, exc: Exception) -> JSONRes
     )
 
 
-# ---- Routers ----
-# Order matters: bulk_router exposes the static /register/export and
-# /register/bulk-upload/* paths and must be registered BEFORE register_router's
-# dynamic /register/{asbestos_site_id} route.
 _PREFIX = settings.api_base_prefix
-
-app.include_router(configuration_router, prefix=_PREFIX, include_in_schema=False)
-app.include_router(audit_router, prefix=_PREFIX, include_in_schema=False)
-app.include_router(files_router, prefix=_PREFIX, include_in_schema=False)
-app.include_router(lookup_router, prefix=_PREFIX, include_in_schema=False)
-app.include_router(bulk_router, prefix=_PREFIX, include_in_schema=False)
-app.include_router(documents_router, prefix=_PREFIX, include_in_schema=False)
-app.include_router(acm_entries_router, prefix=_PREFIX, include_in_schema=False)
-app.include_router(qrcode_router, prefix=_PREFIX, include_in_schema=False)
-app.include_router(register_router, prefix=_PREFIX, include_in_schema=False)
-app.include_router(mobile_router, prefix=_PREFIX)
-
-# Unauthenticated public QR view at the application root.
-app.include_router(public_router, include_in_schema=False)
+app.include_router(asbestos_sites_router, prefix=_PREFIX)
 
 
 @app.get("/health", tags=["health"], include_in_schema=False)
 async def health() -> dict:
     return {"status": "healthy"}
-
-
-# ---- Swagger customisation ----
-# Only mobile routes are visible in Swagger. We strip FastAPI's auto-generated
-# auth header params and replace them with clean explicit fields.
-
-_STRIP_PARAMS = {"authorization", "x-tenant-id", "x-user-id"}
-
-_SWAGGER_AUTH_HEADERS = [
-    {
-        "in": "header",
-        "name": "X-Api-Token",
-        "required": True,
-        "schema": {"type": "string"},
-        "description": "Paste your access token here.",
-    },
-    {
-        "in": "header",
-        "name": "X-Tenant-Id",
-        "required": True,
-        "schema": {"type": "string", "format": "uuid"},
-        "description": "Your tenant UUID.",
-    },
-]
-
-
-def _custom_openapi() -> dict:
-    if app.openapi_schema:
-        return app.openapi_schema
-    schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        description=app.description,
-        routes=app.routes,
-    )
-    for path_item in schema.get("paths", {}).values():
-        for operation in path_item.values():
-            if not isinstance(operation, dict):
-                continue
-            operation["parameters"] = [
-                p for p in operation.get("parameters", [])
-                if p.get("name", "").lower() not in _STRIP_PARAMS
-            ]
-            existing = {p["name"] for p in operation["parameters"]}
-            for header in _SWAGGER_AUTH_HEADERS:
-                if header["name"] not in existing:
-                    operation["parameters"].append(header)
-    app.openapi_schema = schema
-    return schema
-
-
-app.openapi = _custom_openapi

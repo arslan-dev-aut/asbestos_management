@@ -1,9 +1,33 @@
-"""Pydantic schemas for the asbestos_sites domain.
+"""Pydantic schemas for the asbestos_sites domain."""
 
-The GET /asbestos-sites/by-site-id/{site_id} endpoint returns the same
-SiteDetailResponse as the register domain's GET /{asbestos_site_id} endpoint.
-No new response shapes are defined here — this module re-exports the shared
-model for clarity and to keep the domain self-contained.
-"""
+from __future__ import annotations
 
-from backend.domains.register.register_models import SiteDetailResponse  # noqa: F401
+from datetime import date, datetime
+
+from pydantic import BaseModel
+
+from backend.core.responses import ApiResponse
+
+
+class SiteDetail(BaseModel):
+    id: str
+    customerId: str
+    siteId: str
+    customerName: str | None = None
+    siteName: str | None = None
+    highestRisk: str
+    totalAcm: int
+    activeAcm: int
+    ampExpiryDate: date | None = None
+    ampExpiryRag: str
+    ampExpired: bool = False
+    ampExpiringSoon: bool = False
+    createdAt: datetime
+    createdBy: str
+    updatedAt: datetime
+    updatedBy: str
+    updatedByName: str | None = None
+
+
+class SiteDetailResponse(ApiResponse):
+    site: SiteDetail
